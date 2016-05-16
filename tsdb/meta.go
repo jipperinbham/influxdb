@@ -412,6 +412,7 @@ func (d *DatabaseIndex) Measurements() Measurements {
 		measurements = append(measurements, m)
 	}
 	d.mu.RUnlock()
+
 	return measurements
 }
 
