@@ -17,6 +17,7 @@ import (
 	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/services/copier"
 	"github.com/influxdata/influxdb/services/meta"
+	"github.com/influxdata/influxdb/services/replicator"
 	"github.com/influxdata/influxdb/services/snapshotter"
 	"github.com/influxdata/influxdb/services/subscriber"
 	"github.com/influxdata/influxdb/tcp"
@@ -58,6 +59,7 @@ type Server struct {
 	QueryExecutor *cluster.QueryExecutor
 	PointsWriter  *cluster.PointsWriter
 	Subscriber    *subscriber.Service
+	Replicator    *replicator.Service
 
 	Services []Service
 
@@ -159,11 +161,15 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	// Create the Subscriber service
 	s.Subscriber = subscriber.NewService(c.Subscriber)
 
+	s.Replicator = replicator.NewService(c.Replicator)
+
 	// Initialize points writer.
 	s.PointsWriter = cluster.NewPointsWriter()
 	s.PointsWriter.WriteTimeout = time.Duration(c.Cluster.WriteTimeout)
 	s.PointsWriter.TSDBStore = s.TSDBStore
 	s.PointsWriter.Subscriber = s.Subscriber
+	s.PointsWriter.Replicator = s.Replicator
+	s.Replicator.PointsWriter = s.PointsWriter
 
 	// Initialize query executor.
 	s.QueryExecutor = cluster.NewQueryExecutor()
@@ -179,6 +185,8 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	if c.Data.QueryLogEnabled {
 		s.QueryExecutor.LogOutput = os.Stderr
 	}
+	s.QueryExecutor.Replicator = s.Replicator
+	s.Replicator.QueryExecutor = s.QueryExecutor
 
 	// Initialize the monitor
 	s.Monitor.Version = s.buildInfo.Version
@@ -288,6 +296,10 @@ func (s *Server) Open() error {
 		}
 	}
 
+	if err := s.Replicator.Open(); err != nil {
+		return fmt.Errorf("open replicator: %v", err)
+	}
+
 	// Start the reporting service, if not disabled.
 	if !s.reportingDisabled {
 		go s.startServerReporting()
@@ -330,6 +342,10 @@ func (s *Server) Close() error {
 
 	if s.Subscriber != nil {
 		s.Subscriber.Close()
+	}
+
+	if s.Replicator != nil {
+		s.Replicator.Close()
 	}
 
 	if s.MetaClient != nil {

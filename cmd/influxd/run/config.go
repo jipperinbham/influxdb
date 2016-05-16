@@ -20,6 +20,7 @@ import (
 	"github.com/influxdata/influxdb/services/meta"
 	"github.com/influxdata/influxdb/services/opentsdb"
 	"github.com/influxdata/influxdb/services/precreator"
+	"github.com/influxdata/influxdb/services/replicator"
 	"github.com/influxdata/influxdb/services/retention"
 	"github.com/influxdata/influxdb/services/subscriber"
 	"github.com/influxdata/influxdb/services/udp"
@@ -51,6 +52,7 @@ type Config struct {
 	Collectd   collectd.Config   `toml:"collectd"`
 	OpenTSDB   opentsdb.Config   `toml:"opentsdb"`
 	UDPs       []udp.Config      `toml:"udp"`
+	Replicator replicator.Config `toml:"replicator"`
 
 	ContinuousQuery continuous_querier.Config `toml:"continuous_queries"`
 
@@ -81,6 +83,8 @@ func NewConfig() *Config {
 	c.HTTPD = httpd.NewConfig()
 	c.Collectd = collectd.NewConfig()
 	c.OpenTSDB = opentsdb.NewConfig()
+
+	c.Replicator = replicator.NewConfig()
 
 	c.ContinuousQuery = continuous_querier.NewConfig()
 	c.Retention = retention.NewConfig()

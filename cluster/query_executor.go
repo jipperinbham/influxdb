@@ -56,6 +56,11 @@ type QueryExecutor struct {
 
 	// expvar-based stats.
 	statMap *expvar.Map
+
+	Replicator interface {
+		Query() chan<- *influxql.QueryParams
+	}
+	replQuery chan<- *influxql.QueryParams
 }
 
 // Statistics for the QueryExecutor
@@ -154,6 +159,8 @@ func (e *QueryExecutor) executeQuery(query *influxql.Query, database string, chu
 			continue
 		}
 
+		replicateStmt := true
+
 		var rows models.Rows
 		switch stmt := stmt.(type) {
 		case *influxql.AlterRetentionPolicyStatement:
@@ -192,37 +199,51 @@ func (e *QueryExecutor) executeQuery(query *influxql.Query, database string, chu
 			err = e.executeGrantAdminStatement(stmt)
 		case *influxql.KillQueryStatement:
 			err = e.executeKillQueryStatement(stmt)
+			replicateStmt = false
 		case *influxql.RevokeStatement:
 			err = e.executeRevokeStatement(stmt)
 		case *influxql.RevokeAdminStatement:
 			err = e.executeRevokeAdminStatement(stmt)
 		case *influxql.ShowContinuousQueriesStatement:
 			rows, err = e.executeShowContinuousQueriesStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowDatabasesStatement:
 			rows, err = e.executeShowDatabasesStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowDiagnosticsStatement:
 			rows, err = e.executeShowDiagnosticsStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowGrantsForUserStatement:
 			rows, err = e.executeShowGrantsForUserStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowQueriesStatement:
 			rows, err = e.executeShowQueriesStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowRetentionPoliciesStatement:
 			rows, err = e.executeShowRetentionPoliciesStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowServersStatement:
 			// TODO: corylanou add this back for single node
 			err = influxql.ErrInvalidQuery
+			replicateStmt = false
 		case *influxql.ShowShardsStatement:
 			rows, err = e.executeShowShardsStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowShardGroupsStatement:
 			rows, err = e.executeShowShardGroupsStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowStatsStatement:
 			rows, err = e.executeShowStatsStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowSubscriptionsStatement:
 			rows, err = e.executeShowSubscriptionsStatement(stmt)
+			replicateStmt = false
 		case *influxql.ShowTagValuesStatement:
 			rows, err = e.executeShowTagValuesStatement(stmt, database)
+			replicateStmt = false
 		case *influxql.ShowUsersStatement:
 			rows, err = e.executeShowUsersStatement(stmt)
+			replicateStmt = false
 		case *influxql.SetPasswordUserStatement:
 			err = e.executeSetPasswordUserStatement(stmt)
 		default:
@@ -239,6 +260,22 @@ func (e *QueryExecutor) executeQuery(query *influxql.Query, database string, chu
 		// Stop after the first error.
 		if err != nil {
 			break
+		}
+
+		if e.Replicator != nil && replicateStmt {
+			logger.Println("sending replQuery", stmt.String())
+			if e.replQuery == nil {
+				logger.Println("init'ing replQuery")
+				e.replQuery = e.Replicator.Query()
+				logger.Println("replQuery init'd")
+			}
+			e.replQuery <- &influxql.QueryParams{
+				Query: &influxql.Query{
+					Statements: []influxql.Statement{stmt},
+				},
+				Database: database,
+			}
+			logger.Printf("replQuery %s sent\n", stmt.String())
 		}
 	}
 

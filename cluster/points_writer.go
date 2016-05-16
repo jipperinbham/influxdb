@@ -75,6 +75,11 @@ type PointsWriter struct {
 	}
 	subPoints chan<- *WritePointsRequest
 
+	Replicator interface {
+		Points() chan<- *WritePointsRequest
+	}
+	replPoints chan<- *WritePointsRequest
+
 	statMap *expvar.Map
 }
 
@@ -121,6 +126,9 @@ func (w *PointsWriter) Open() error {
 	if w.Subscriber != nil {
 		w.subPoints = w.Subscriber.Points()
 	}
+	if w.Replicator != nil {
+		w.replPoints = w.Replicator.Points()
+	}
 	return nil
 }
 
@@ -136,6 +144,9 @@ func (w *PointsWriter) Close() error {
 		// select statement in WritePoints hit its default case
 		// dropping any in-flight writes.
 		w.subPoints = nil
+	}
+	if w.replPoints != nil {
+		w.replPoints = nil
 	}
 	return nil
 }
@@ -211,6 +222,10 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
 		go func(shard *meta.ShardInfo, database, retentionPolicy string, points []models.Point) {
 			ch <- w.writeToShard(shard, database, retentionPolicy, points)
 		}(shardMappings.Shards[shardID], database, retentionPolicy, points)
+	}
+
+	if database != "_internal" {
+		w.replPoints <- &WritePointsRequest{Database: database, RetentionPolicy: retentionPolicy, Points: points}
 	}
 
 	// Send points to subscriptions if possible.
