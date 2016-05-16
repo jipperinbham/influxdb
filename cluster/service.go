@@ -3,6 +3,7 @@ package cluster
 import (
 	"encoding"
 	"encoding/binary"
+	"errors"
 	"expvar"
 	"fmt"
 	"io"
@@ -91,9 +92,10 @@ func (s *Service) Open() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[cluster] ", log.LstdFlags)
 }
 
 // serve accepts connections from the listener and handles them.
@@ -232,6 +234,8 @@ func (s *Service) processExecuteStatementRequest(buf []byte) error {
 
 func (s *Service) executeStatement(stmt influxql.Statement, database string) error {
 	switch t := stmt.(type) {
+	case *influxql.DeleteSeriesStatement:
+		return s.TSDBStore.DeleteSeries(database, t.Sources, t.Condition)
 	case *influxql.DropDatabaseStatement:
 		return s.TSDBStore.DeleteDatabase(t.Name)
 	case *influxql.DropMeasurementStatement:
@@ -325,14 +329,24 @@ func (s *Service) processCreateIteratorRequest(conn net.Conn) {
 			return err
 		}
 
+		sh, ok := s.TSDBStore.(ShardIteratorCreator)
+		if !ok {
+			return errors.New("unable to access a specific shard with this tsdb store")
+		}
+
 		// Collect iterator creators for each shard.
 		ics := make([]influxql.IteratorCreator, 0, len(req.ShardIDs))
 		for _, shardID := range req.ShardIDs {
-			ic := s.TSDBStore.ShardIteratorCreator(shardID)
+			ic := sh.ShardIteratorCreator(shardID)
 			if ic == nil {
-				return nil
+				continue
 			}
 			ics = append(ics, ic)
+		}
+
+		// Return immediately if there are no iterator creators.
+		if len(ics) == 0 {
+			return nil
 		}
 
 		// Generate a single iterator from all shards.
@@ -344,14 +358,28 @@ func (s *Service) processCreateIteratorRequest(conn net.Conn) {
 
 		return nil
 	}(); err != nil {
-		itr.Close()
 		s.Logger.Printf("error reading CreateIterator request: %s", err)
 		EncodeTLV(conn, createIteratorResponseMessage, &CreateIteratorResponse{Err: err})
 		return
 	}
 
+	resp := CreateIteratorResponse{}
+	if itr != nil {
+		switch itr.(type) {
+		case influxql.FloatIterator:
+			resp.Type = influxql.Float
+		case influxql.IntegerIterator:
+			resp.Type = influxql.Integer
+		case influxql.StringIterator:
+			resp.Type = influxql.String
+		case influxql.BooleanIterator:
+			resp.Type = influxql.Boolean
+		}
+		resp.Stats = itr.Stats()
+	}
+
 	// Encode success response.
-	if err := EncodeTLV(conn, createIteratorResponseMessage, &CreateIteratorResponse{}); err != nil {
+	if err := EncodeTLV(conn, createIteratorResponseMessage, &resp); err != nil {
 		s.Logger.Printf("error writing CreateIterator response: %s", err)
 		return
 	}
@@ -377,10 +405,15 @@ func (s *Service) processFieldDimensionsRequest(conn net.Conn) {
 			return err
 		}
 
+		sh, ok := s.TSDBStore.(ShardIteratorCreator)
+		if !ok {
+			return errors.New("unable to access a specific shard with this tsdb store")
+		}
+
 		// Collect iterator creators for each shard.
 		ics := make([]influxql.IteratorCreator, 0, len(req.ShardIDs))
 		for _, shardID := range req.ShardIDs {
-			ic := s.TSDBStore.ShardIteratorCreator(shardID)
+			ic := sh.ShardIteratorCreator(shardID)
 			if ic == nil {
 				return nil
 			}
@@ -420,10 +453,15 @@ func (s *Service) processSeriesKeysRequest(conn net.Conn) {
 			return err
 		}
 
+		sh, ok := s.TSDBStore.(ShardIteratorCreator)
+		if !ok {
+			return errors.New("unable to access a specific shard with this tsdb store")
+		}
+
 		// Collect iterator creators for each shard.
 		ics := make([]influxql.IteratorCreator, 0, len(req.ShardIDs))
 		for _, shardID := range req.ShardIDs {
-			ic := s.TSDBStore.ShardIteratorCreator(shardID)
+			ic := sh.ShardIteratorCreator(shardID)
 			if ic == nil {
 				return nil
 			}

@@ -30,6 +30,65 @@ type TSMReader struct {
 	lastModified int64
 }
 
+// TSMIndex represent the index section of a TSM file.  The index records all
+// blocks, their locations, sizes, min and max times.
+type TSMIndex interface {
+
+	// Delete removes the given keys from the index.
+	Delete(keys []string)
+
+	// DeleteRange removes the given keys with data between minTime and maxTime from the index.
+	DeleteRange(keys []string, minTime, maxTime int64)
+
+	// Contains return true if the given key exists in the index.
+	Contains(key string) bool
+
+	// ContainsValue returns true if key and time might exists in this file.  This function could
+	// return true even though the actual point does not exists.  For example, the key may
+	// exists in this file, but not have point exactly at time t.
+	ContainsValue(key string, timestamp int64) bool
+
+	// Entries returns all index entries for a key.
+	Entries(key string) []IndexEntry
+
+	// ReadEntries reads the index entries for key into entries.
+	ReadEntries(key string, entries *[]IndexEntry)
+
+	// Entry returns the index entry for the specified key and timestamp.  If no entry
+	// matches the key and timestamp, nil is returned.
+	Entry(key string, timestamp int64) *IndexEntry
+
+	// Key returns the key in the index at the given postion.
+	Key(index int) (string, []IndexEntry)
+
+	// KeyAt returns the key in the index at the given postion.
+	KeyAt(index int) (string, byte)
+
+	// KeyCount returns the count of unique keys in the index.
+	KeyCount() int
+
+	// Size returns the size of a the current index in bytes
+	Size() uint32
+
+	// TimeRange returns the min and max time across all keys in the file.
+	TimeRange() (int64, int64)
+
+	// TombstoneRange returns ranges of time that are deleted for the given key.
+	TombstoneRange(key string) []TimeRange
+
+	// KeyRange returns the min and max keys in the file.
+	KeyRange() (string, string)
+
+	// Type returns the block type of the values stored for the key.  Returns one of
+	// BlockFloat64, BlockInt64, BlockBool, BlockString.  If key does not exist,
+	// an error is returned.
+	Type(key string) (byte, error)
+
+	// UnmarshalBinary populates an index from an encoded byte slice
+	// representation of an index.
+	UnmarshalBinary(b []byte) error
+}
+
 // BlockIterator allows iterating over each block in a TSM file in order.  It provides
 // raw access to the block bytes without decoding them.
 type BlockIterator struct {
@@ -71,88 +130,53 @@ func (b *BlockIterator) Next() bool {
 	if b.n-b.i > 0 {
 		b.key, b.entries = b.r.Key(b.i)
 		b.i++
-		return true
+
+		if len(b.entries) > 0 {
+			return true
+		}
 	}
 
 	return false
 }
 
-func (b *BlockIterator) Read() (string, int64, int64, []byte, error) {
+func (b *BlockIterator) Read() (string, int64, int64, uint32, []byte, error) {
 	if b.err != nil {
-		return "", 0, 0, nil, b.err
+		return "", 0, 0, 0, nil, b.err
 	}
-
-	buf, err := b.r.readBytes(&b.entries[0], nil)
+	checksum, buf, err := b.r.readBytes(&b.entries[0], nil)
 	if err != nil {
-		return "", 0, 0, nil, err
+		return "", 0, 0, 0, nil, err
 	}
-	return b.key, b.entries[0].MinTime, b.entries[0].MaxTime, buf, err
+	return b.key, b.entries[0].MinTime, b.entries[0].MaxTime, checksum, buf, err
 }
 
 // blockAccessor abstracts a method of accessing blocks from a
 // TSM file.
 type blockAccessor interface {
-	init() (TSMIndex, error)
+	init() (*indirectIndex, error)
 	read(key string, timestamp int64) ([]Value, error)
 	readAll(key string) ([]Value, error)
 	readBlock(entry *IndexEntry, values []Value) ([]Value, error)
-	readFloatBlock(entry *IndexEntry, values []FloatValue) ([]FloatValue, error)
-	readIntegerBlock(entry *IndexEntry, values []IntegerValue) ([]IntegerValue, error)
-	readStringBlock(entry *IndexEntry, values []StringValue) ([]StringValue, error)
-	readBooleanBlock(entry *IndexEntry, values []BooleanValue) ([]BooleanValue, error)
-	readBytes(entry *IndexEntry, buf []byte) ([]byte, error)
+	readFloatBlock(entry *IndexEntry, tdec *TimeDecoder, fdec *FloatDecoder, values *[]FloatValue) ([]FloatValue, error)
+	readIntegerBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *IntegerDecoder, values *[]IntegerValue) ([]IntegerValue, error)
+	readStringBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *StringDecoder, values *[]StringValue) ([]StringValue, error)
+	readBooleanBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *BooleanDecoder, values *[]BooleanValue) ([]BooleanValue, error)
+	readBytes(entry *IndexEntry, buf []byte) (uint32, []byte, error)
 	path() string
 	close() error
 }
 
-type TSMReaderOptions struct {
-	// Reader is used to create file IO based reader.
-	Reader io.ReadSeeker
-
-	// MMAPFile is used to create an MMAP based reader.
-	MMAPFile *os.File
-}
-
-func NewTSMReader(r io.ReadSeeker) (*TSMReader, error) {
-	return NewTSMReaderWithOptions(
-		TSMReaderOptions{
-			Reader: r,
-		})
-}
-
-func NewTSMReaderWithOptions(opt TSMReaderOptions) (*TSMReader, error) {
+func NewTSMReader(f *os.File) (*TSMReader, error) {
 	t := &TSMReader{}
-	if opt.Reader != nil {
-		// Seek to the end of the file to determine the size
-		size, err := opt.Reader.Seek(0, os.SEEK_END)
-		if err != nil {
-			return nil, err
-		}
-		t.size = size
-		if f, ok := opt.Reader.(*os.File); ok {
-			stat, err := f.Stat()
-			if err != nil {
-				return nil, err
-			}
 
-			t.lastModified = stat.ModTime().UnixNano()
-		}
-		t.accessor = &fileAccessor{
-			r: opt.Reader,
-		}
-
-	} else if opt.MMAPFile != nil {
-		stat, err := opt.MMAPFile.Stat()
-		if err != nil {
-			return nil, err
-		}
-		t.size = stat.Size()
-		t.lastModified = stat.ModTime().UnixNano()
-		t.accessor = &mmapAccessor{
-			f: opt.MMAPFile,
-		}
-	} else {
-		panic("invalid options: need Reader or MMAPFile")
+	stat, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	t.size = stat.Size()
+	t.lastModified = stat.ModTime().UnixNano()
+	t.accessor = &mmapAccessor{
+		f: f,
 	}
 
 	index, err := t.accessor.init()
@@ -177,8 +201,26 @@ func (t *TSMReader) applyTombstones() error {
 		return fmt.Errorf("init: read tombstones: %v", err)
 	}
 
-	// Update our index
-	t.index.Delete(tombstones)
+	if len(tombstones) == 0 {
+		return nil
+	}
+
+	var cur, prev Tombstone
+	cur = tombstones[0]
+	batch := []string{cur.Key}
+	for i := 1; i < len(tombstones); i++ {
+		cur = tombstones[i]
+		prev = tombstones[i-1]
+		if prev.Min != cur.Min || prev.Max != cur.Max {
+			t.index.DeleteRange(batch, prev.Min, prev.Max)
+			batch = batch[:0]
+		}
+		batch = append(batch, cur.Key)
+	}
+
+	if len(batch) > 0 {
+		t.index.DeleteRange(batch, cur.Min, cur.Max)
+	}
 	return nil
 }
 
@@ -189,15 +231,11 @@ func (t *TSMReader) Path() string {
 	return t.accessor.path()
 }
 
-func (t *TSMReader) Keys() []string {
-	return t.index.Keys()
-}
-
 func (t *TSMReader) Key(index int) (string, []IndexEntry) {
 	return t.index.Key(index)
 }
 
-// KeyAt returns the key and key typegi at position idx in the index.
+// KeyAt returns the key and key type at position idx in the index.
 func (t *TSMReader) KeyAt(idx int) (string, byte) {
 	return t.index.KeyAt(idx)
 }
@@ -209,28 +247,28 @@ func (t *TSMReader) ReadAt(entry *IndexEntry, vals []Value) ([]Value, error) {
 	return t.accessor.readBlock(entry, vals)
 }
 
-func (t *TSMReader) ReadFloatBlockAt(entry *IndexEntry, vals []FloatValue) ([]FloatValue, error) {
+func (t *TSMReader) ReadFloatBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *FloatDecoder, vals *[]FloatValue) ([]FloatValue, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.accessor.readFloatBlock(entry, vals)
+	return t.accessor.readFloatBlock(entry, tdec, vdec, vals)
 }
 
-func (t *TSMReader) ReadIntegerBlockAt(entry *IndexEntry, vals []IntegerValue) ([]IntegerValue, error) {
+func (t *TSMReader) ReadIntegerBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *IntegerDecoder, vals *[]IntegerValue) ([]IntegerValue, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.accessor.readIntegerBlock(entry, vals)
+	return t.accessor.readIntegerBlock(entry, tdec, vdec, vals)
 }
 
-func (t *TSMReader) ReadStringBlockAt(entry *IndexEntry, vals []StringValue) ([]StringValue, error) {
+func (t *TSMReader) ReadStringBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *StringDecoder, vals *[]StringValue) ([]StringValue, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.accessor.readStringBlock(entry, vals)
+	return t.accessor.readStringBlock(entry, tdec, vdec, vals)
 }
 
-func (t *TSMReader) ReadBooleanBlockAt(entry *IndexEntry, vals []BooleanValue) ([]BooleanValue, error) {
+func (t *TSMReader) ReadBooleanBlockAt(entry *IndexEntry, tdec *TimeDecoder, vdec *BooleanDecoder, vals *[]BooleanValue) ([]BooleanValue, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
-	return t.accessor.readBooleanBlock(entry, vals)
+	return t.accessor.readBooleanBlock(entry, tdec, vdec, vals)
 }
 
 func (t *TSMReader) Read(key string, timestamp int64) ([]Value, error) {
@@ -248,7 +286,7 @@ func (t *TSMReader) ReadAll(key string) ([]Value, error) {
 	return t.accessor.readAll(key)
 }
 
-func (t *TSMReader) readBytes(e *IndexEntry, b []byte) ([]byte, error) {
+func (t *TSMReader) readBytes(e *IndexEntry, b []byte) (uint32, []byte, error) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.accessor.readBytes(e, b)
@@ -290,6 +328,16 @@ func (t *TSMReader) Contains(key string) bool {
 // exists in this file, but not have point exactly at time t.
 func (t *TSMReader) ContainsValue(key string, ts int64) bool {
 	return t.index.ContainsValue(key, ts)
+}
+
+// DeleteRange removes the given points for keys between minTime and maxTime
+func (t *TSMReader) DeleteRange(keys []string, minTime, maxTime int64) error {
+	if err := t.tombstoner.AddRange(keys, minTime, maxTime); err != nil {
+		return err
+	}
+
+	t.index.DeleteRange(keys, minTime, maxTime)
+	return nil
 }
 
 func (t *TSMReader) Delete(keys []string) error {
@@ -351,6 +399,13 @@ func (t *TSMReader) TombstoneFiles() []FileStat {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	return t.tombstoner.TombstoneFiles()
+}
+
+// TombstoneRange returns ranges of time that are deleted for the given key.
+func (t *TSMReader) TombstoneRange(key string) []TimeRange {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	return t.index.TombstoneRange(key)
 }
 
 func (t *TSMReader) Stats() FileStat {
@@ -427,19 +482,21 @@ type indirectIndex struct {
 	// minTime, maxTime are the minimum and maximum times contained in the file across all
 	// series.
 	minTime, maxTime int64
+
+	// tombstones contains only the tombstoned keys with subset of time values deleted.  An
+	// entry would exist here if a subset of the points for a key were deleted and the file
+	// had not be re-compacted to remove the points on disk.
+	tombstones map[string][]TimeRange
 }
 
-func NewIndirectIndex() TSMIndex {
-	return &indirectIndex{}
+type TimeRange struct {
+	Min, Max int64
 }
 
-// Add records a new block entry for a key in the index.
-func (d *indirectIndex) Add(key string, blockType byte, minTime, maxTime int64, offset int64, size uint32) {
-	panic("unsupported operation")
-}
-
-func (d *indirectIndex) Write(w io.Writer) error {
-	panic("unsupported operation")
+func NewIndirectIndex() *indirectIndex {
+	return &indirectIndex{
+		tombstones: make(map[string][]TimeRange),
+	}
 }
 
 // search returns the index of i in offsets for where key is located.  If key is not
@@ -532,18 +589,6 @@ func (d *indirectIndex) Entry(key string, timestamp int64) *IndexEntry {
 	return nil
 }
 
-func (d *indirectIndex) Keys() []string {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-
-	var keys []string
-	for _, offset := range d.offsets {
-		_, key, _ := readKey(d.b[offset:])
-		keys = append(keys, string(key))
-	}
-	return keys
-}
-
 func (d *indirectIndex) Key(idx int) (string, []IndexEntry) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
@@ -601,12 +646,89 @@ func (d *indirectIndex) Delete(keys []string) {
 	d.offsets = offsets
 }
 
+func (d *indirectIndex) DeleteRange(keys []string, minTime, maxTime int64) {
+	// No keys, nothing to do
+	if len(keys) == 0 {
+		return
+	}
+
+	// If we're deleting the max time range, just use tombstoning to remove the
+	// key from the offsets slice
+	if minTime == math.MinInt64 && maxTime == math.MaxInt64 {
+		d.Delete(keys)
+		return
+	}
+
+	// Is the range passed in outside of the time range for the file?
+	min, max := d.TimeRange()
+	if minTime > max || maxTime < min {
+		return
+	}
+
+	tombstones := map[string][]TimeRange{}
+	for _, k := range keys {
+
+		// Is the range passed in outside the time range for this key?
+		entries := d.Entries(k)
+
+		// If multiple tombstones are saved for the same key
+		if len(entries) == 0 {
+			continue
+		}
+
+		min, max := entries[0].MinTime, entries[len(entries)-1].MaxTime
+		if minTime > max || maxTime < min {
+			continue
+		}
+
+		// Is the range passed in cover every value for the key?
+		if minTime <= min && maxTime >= max {
+			d.Delete(keys)
+			continue
+		}
+
+		tombstones[k] = append(tombstones[k], TimeRange{minTime, maxTime})
+	}
+
+	if len(tombstones) == 0 {
+		return
+	}
+
+	d.mu.Lock()
+	for k, v := range tombstones {
+		d.tombstones[k] = append(d.tombstones[k], v...)
+	}
+	d.mu.Unlock()
+
+}
+
+func (d *indirectIndex) TombstoneRange(key string) []TimeRange {
+	d.mu.RLock()
+	r := d.tombstones[key]
+	d.mu.RUnlock()
+	return r
+}
+
 func (d *indirectIndex) Contains(key string) bool {
 	return len(d.Entries(key)) > 0
 }
 
 func (d *indirectIndex) ContainsValue(key string, timestamp int64) bool {
-	return d.Entry(key, timestamp) != nil
+	entry := d.Entry(key, timestamp)
+	if entry == nil {
+		return false
+	}
+
+	d.mu.RLock()
+	tombstones := d.tombstones[key]
+	d.mu.RUnlock()
+
+	for _, t := range tombstones {
+		if t.Min <= timestamp && t.Max >= timestamp {
+			return false
+		}
+	}
+	return true
 }
 
 func (d *indirectIndex) Type(key string) (byte, error) {
@@ -716,230 +838,6 @@ func (d *indirectIndex) Size() uint32 {
 	return uint32(len(d.b))
 }
 
-// fileAccessor is file IO based block accessor.  It provides access to blocks
-// using a file IO based approach (seek, read, etc.)
-type fileAccessor struct {
-	mu    sync.Mutex
-	r     io.ReadSeeker
-	index TSMIndex
-}
-
-func (f *fileAccessor) init() (TSMIndex, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// Verify it's a TSM file of the right version
-	if err := verifyVersion(f.r); err != nil {
-		return nil, err
-	}
-
-	// Current the readers size
-	size, err := f.r.Seek(0, os.SEEK_END)
-	if err != nil {
-		return nil, fmt.Errorf("init: failed to seek: %v", err)
-	}
-
-	indexEnd := size - 8
-
-	// Seek to index location pointer
-	_, err = f.r.Seek(-8, os.SEEK_END)
-	if err != nil {
-		return nil, fmt.Errorf("init: failed to seek to index ptr: %v", err)
-	}
-
-	// Read the absolute position of the start of the index
-	b := make([]byte, 8)
-	_, err = f.r.Read(b)
-	if err != nil {
-		return nil, fmt.Errorf("init: failed to read index ptr: %v", err)
-
-	}
-
-	indexStart := int64(binary.BigEndian.Uint64(b))
-
-	_, err = f.r.Seek(indexStart, os.SEEK_SET)
-	if err != nil {
-		return nil, fmt.Errorf("init: failed to seek to index: %v", err)
-	}
-
-	b = make([]byte, indexEnd-indexStart)
-	f.index = &directIndex{
-		blocks: map[string]*indexEntries{},
-	}
-	_, err = f.r.Read(b)
-	if err != nil {
-		return nil, fmt.Errorf("init: read index: %v", err)
-	}
-
-	if err := f.index.UnmarshalBinary(b); err != nil {
-		return nil, fmt.Errorf("init: unmarshal error: %v", err)
-	}
-
-	return f.index, nil
-}
-
-func (f *fileAccessor) read(key string, timestamp int64) ([]Value, error) {
-	entry := f.index.Entry(key, timestamp)
-
-	if entry == nil {
-		return nil, nil
-	}
-
-	return f.readBlock(entry, nil)
-}
-
-func (f *fileAccessor) readBlock(entry *IndexEntry, values []Value) ([]Value, error) {
-	b, err := f.readBytes(entry, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	//TODO: Validate checksum
-	values, err = DecodeBlock(b, values)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-func (f *fileAccessor) readFloatBlock(entry *IndexEntry, values []FloatValue) ([]FloatValue, error) {
-	b, err := f.readBytes(entry, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Validate checksum
-	values, err = DecodeFloatBlock(b, values)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-func (f *fileAccessor) readIntegerBlock(entry *IndexEntry, values []IntegerValue) ([]IntegerValue, error) {
-	b, err := f.readBytes(entry, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Validate checksum
-	values, err = DecodeIntegerBlock(b, values)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-func (f *fileAccessor) readStringBlock(entry *IndexEntry, values []StringValue) ([]StringValue, error) {
-	b, err := f.readBytes(entry, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Validate checksum
-	values, err = DecodeStringBlock(b, values)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-func (f *fileAccessor) readBooleanBlock(entry *IndexEntry, values []BooleanValue) ([]BooleanValue, error) {
-	b, err := f.readBytes(entry, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	// TODO: Validate checksum
-	values, err = DecodeBooleanBlock(b, values)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-func (f *fileAccessor) readBytes(entry *IndexEntry, b []byte) ([]byte, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	// TODO: remove this allocation
-	if b == nil {
-		b = make([]byte, entry.Size)
-	}
-
-	_, err := f.r.Seek(entry.Offset, os.SEEK_SET)
-	if err != nil {
-		return nil, err
-	}
-
-	if int(entry.Size) > len(b) {
-		b = make([]byte, entry.Size)
-	}
-
-	n, err := f.r.Read(b[:entry.Size])
-	if err != nil {
-		return nil, err
-	}
-
-	return b[4:n], nil
-}
-
-// ReadAll returns all values for a key in all blocks.
-func (f *fileAccessor) readAll(key string) ([]Value, error) {
-	var values []Value
-	blocks := f.index.Entries(key)
-	if len(blocks) == 0 {
-		return values, nil
-	}
-
-	var temp []Value
-	// TODO: we can determine the max block size when loading the file create/re-use
-	// a reader level buf then.
-	b := make([]byte, 16*1024)
-	for _, block := range blocks {
-
-		b, err := f.readBytes(&block, b)
-		if err != nil {
-			return nil, err
-		}
-
-		//TODO: Validate checksum
-		temp = temp[:0]
-		temp, err = DecodeBlock(b, temp)
-		if err != nil {
-			return nil, err
-		}
-		values = append(values, temp...)
-	}
-
-	return values, nil
-}
-
-func (f *fileAccessor) path() string {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if fd, ok := f.r.(*os.File); ok {
-		return fd.Name()
-	}
-	return ""
-}
-
-func (f *fileAccessor) close() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	if c, ok := f.r.(io.Closer); ok {
-		return c.Close()
-	}
-	return nil
-}
-
 // mmapAccess is mmap based block accessor.  It access blocks through an
 // MMAP file interface.
 type mmapAccessor struct {
@@ -947,10 +845,10 @@ type mmapAccessor struct {
 
 	f     *os.File
 	b     []byte
-	index TSMIndex
+	index *indirectIndex
 }
 
-func (m *mmapAccessor) init() (TSMIndex, error) {
+func (m *mmapAccessor) init() (*indirectIndex, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -1011,7 +909,24 @@ func (m *mmapAccessor) readBlock(entry *IndexEntry, values []Value) ([]Value, er
 	return values, nil
 }
 
-func (m *mmapAccessor) readFloatBlock(entry *IndexEntry, values []FloatValue) ([]FloatValue, error) {
+func (m *mmapAccessor) readFloatBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *FloatDecoder, values *[]FloatValue) ([]FloatValue, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	if int64(len(m.b)) < entry.Offset+int64(entry.Size) {
+		return nil, ErrTSMClosed
+	}
+
+	//TODO: Validate checksum
+	a, err := DecodeFloatBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], tdec, vdec, values)
+	if err != nil {
+		return nil, err
+	}
+
+	return a, nil
+}
+
+func (m *mmapAccessor) readIntegerBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *IntegerDecoder, values *[]IntegerValue) ([]IntegerValue, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -1019,16 +934,15 @@ func (m *mmapAccessor) readFloatBlock(entry *IndexEntry, values []FloatValue) ([
 		return nil, ErrTSMClosed
 	}
 	//TODO: Validate checksum
-	var err error
-	values, err = DecodeFloatBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], values)
+	a, err := DecodeIntegerBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], tdec, vdec, values)
 	if err != nil {
 		return nil, err
 	}
 
-	return values, nil
+	return a, nil
 }
 
-func (m *mmapAccessor) readIntegerBlock(entry *IndexEntry, values []IntegerValue) ([]IntegerValue, error) {
+func (m *mmapAccessor) readStringBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *StringDecoder, values *[]StringValue) ([]StringValue, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -1036,16 +950,15 @@ func (m *mmapAccessor) readIntegerBlock(entry *IndexEntry, values []IntegerValue
 		return nil, ErrTSMClosed
 	}
 	//TODO: Validate checksum
-	var err error
-	values, err = DecodeIntegerBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], values)
+	a, err := DecodeStringBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], tdec, vdec, values)
 	if err != nil {
 		return nil, err
 	}
 
-	return values, nil
+	return a, nil
 }
 
-func (m *mmapAccessor) readStringBlock(entry *IndexEntry, values []StringValue) ([]StringValue, error) {
+func (m *mmapAccessor) readBooleanBlock(entry *IndexEntry, tdec *TimeDecoder, vdec *BooleanDecoder, values *[]BooleanValue) ([]BooleanValue, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -1053,42 +966,24 @@ func (m *mmapAccessor) readStringBlock(entry *IndexEntry, values []StringValue) 
 		return nil, ErrTSMClosed
 	}
 	//TODO: Validate checksum
-	var err error
-	values, err = DecodeStringBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], values)
+	a, err := DecodeBooleanBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], tdec, vdec, values)
 	if err != nil {
 		return nil, err
 	}
 
-	return values, nil
+	return a, nil
 }
 
-func (m *mmapAccessor) readBooleanBlock(entry *IndexEntry, values []BooleanValue) ([]BooleanValue, error) {
+func (m *mmapAccessor) readBytes(entry *IndexEntry, b []byte) (uint32, []byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	if int64(len(m.b)) < entry.Offset+int64(entry.Size) {
-		return nil, ErrTSMClosed
-	}
-	//TODO: Validate checksum
-	var err error
-	values, err = DecodeBooleanBlock(m.b[entry.Offset+4:entry.Offset+int64(entry.Size)], values)
-	if err != nil {
-		return nil, err
-	}
-
-	return values, nil
-}
-
-func (m *mmapAccessor) readBytes(entry *IndexEntry, b []byte) ([]byte, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	if int64(len(m.b)) < entry.Offset+int64(entry.Size) {
-		return nil, ErrTSMClosed
+		return 0, nil, ErrTSMClosed
 	}
 
 	// return the bytes after the 4 byte checksum
-	return m.b[entry.Offset+4 : entry.Offset+int64(entry.Size)], nil
+	return binary.BigEndian.Uint32(m.b[entry.Offset : entry.Offset+4]), m.b[entry.Offset+4 : entry.Offset+int64(entry.Size)], nil
 }
 
 // ReadAll returns all values for a key in all blocks.
@@ -1098,6 +993,8 @@ func (m *mmapAccessor) readAll(key string) ([]Value, error) {
 		return nil, nil
 	}
 
+	tombstones := m.index.TombstoneRange(key)
+
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
@@ -1105,6 +1002,18 @@ func (m *mmapAccessor) readAll(key string) ([]Value, error) {
 	var err error
 	var values []Value
 	for _, block := range blocks {
+		var skip bool
+		for _, t := range tombstones {
+			// Should we skip this block because it contains points that have been deleted
+			if t.Min <= block.MinTime && t.Max >= block.MaxTime {
+				skip = true
+				break
+			}
+		}
+
+		if skip {
+			continue
+		}
 		//TODO: Validate checksum
 		temp = temp[:0]
 		// The +4 is the 4 byte checksum length
@@ -1112,6 +1021,12 @@ func (m *mmapAccessor) readAll(key string) ([]Value, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		// Filter out any values that were deleted
+		for _, t := range tombstones {
+			temp = Values(temp).Filter(t.Min, t.Max)
+		}
+
 		values = append(values, temp...)
 	}
 

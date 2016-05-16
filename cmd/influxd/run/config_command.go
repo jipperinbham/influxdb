@@ -36,7 +36,8 @@ func (cmd *PrintConfigCommand) Run(args ...string) error {
 	}
 
 	// Parse config from path.
-	config, err := cmd.parseConfig(*configPath)
+	opt := Options{ConfigPath: *configPath}
+	config, err := cmd.parseConfig(opt.GetConfigPath())
 	if err != nil {
 		return fmt.Errorf("parse config: %s", err)
 	}
@@ -65,10 +66,9 @@ func (cmd *PrintConfigCommand) parseConfig(path string) (*Config, error) {
 	}
 
 	config := NewConfig()
-	if _, err := toml.DecodeFile(path, &config); err != nil {
+	if err := config.FromTomlFile(path); err != nil {
 		return nil, err
 	}
-	config.InitTableAttrs()
 	return config, nil
 }
 

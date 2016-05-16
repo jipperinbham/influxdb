@@ -11,8 +11,6 @@ import (
 	"runtime"
 	"strconv"
 	"time"
-
-	"github.com/BurntSushi/toml"
 )
 
 const logo = `
@@ -87,7 +85,7 @@ func (cmd *Command) Run(args ...string) error {
 	runtime.SetBlockProfileRate(int(1 * time.Second))
 
 	// Parse config
-	config, err := cmd.ParseConfig(options.ConfigPath)
+	config, err := cmd.ParseConfig(options.GetConfigPath())
 	if err != nil {
 		return fmt.Errorf("parse config: %s", err)
 	}
@@ -202,7 +200,7 @@ func (cmd *Command) ParseConfig(path string) (*Config, error) {
 	log.Printf("Using configuration at: %s\n", path)
 
 	config := NewConfig()
-	if _, err := toml.DecodeFile(path, &config); err != nil {
+	if err := config.FromTomlFile(path); err != nil {
 		return nil, err
 	}
 
@@ -238,4 +236,29 @@ type Options struct {
 	Hostname   string
 	CPUProfile string
 	MemProfile string
+}
+
+// GetConfigPath returns the config path from the options.
+// It will return a path by searching in this order:
+//   1. The CLI option in ConfigPath
+//   2. The environment variable INFLUXDB_CONFIG_PATH
+//   3. The first influxdb.conf file on the path:
+//        - ~/.influxdb
+//        - /etc/influxdb
+func (opt *Options) GetConfigPath() string {
+	if opt.ConfigPath != "" {
+		return opt.ConfigPath
+	} else if envVar := os.Getenv("INFLUXDB_CONFIG_PATH"); envVar != "" {
+		return envVar
+	}
+
+	for _, path := range []string{
+		os.ExpandEnv("${HOME}/.influxdb/influxdb.conf"),
+		"/etc/influxdb/influxdb.conf",
+	} {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+	return ""
 }

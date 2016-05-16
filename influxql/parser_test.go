@@ -197,6 +197,37 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		{
+			s: `SELECT derivative(field1, 1h) / derivative(field2, 1h) FROM myseries`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{
+						Expr: &influxql.BinaryExpr{
+							LHS: &influxql.Call{
+								Name: "derivative",
+								Args: []influxql.Expr{
+									&influxql.VarRef{Val: "field1"},
+									&influxql.DurationLiteral{Val: time.Hour},
+								},
+							},
+							RHS: &influxql.Call{
+								Name: "derivative",
+								Args: []influxql.Expr{
+									&influxql.VarRef{Val: "field2"},
+									&influxql.DurationLiteral{Val: time.Hour},
+								},
+							},
+							Op: influxql.DIV,
+						},
+					},
+				},
+				Sources: []influxql.Source{
+					&influxql.Measurement{Name: "myseries"},
+				},
+			},
+		},
+
 		// difference
 		{
 			s: `SELECT difference(field1) FROM myseries;`,
@@ -377,6 +408,18 @@ func TestParser_ParseStatement(t *testing.T) {
 				IsRawQuery: false,
 				Fields: []*influxql.Field{
 					{Expr: &influxql.Call{Name: "percentile", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.NumberLiteral{Val: 2.0}}}},
+				},
+				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+			},
+		},
+
+		{
+			s: `select percentile("field1", 2.0), field2 from cpu`,
+			stmt: &influxql.SelectStatement{
+				IsRawQuery: false,
+				Fields: []*influxql.Field{
+					{Expr: &influxql.Call{Name: "percentile", Args: []influxql.Expr{&influxql.VarRef{Val: "field1"}, &influxql.NumberLiteral{Val: 2.0}}}},
+					{Expr: &influxql.VarRef{Val: "field2"}},
 				},
 				Sources: []influxql.Source{&influxql.Measurement{Name: "cpu"}},
 			},
@@ -745,12 +788,6 @@ func TestParser_ParseStatement(t *testing.T) {
 		//	},
 		//},
 
-		// SHOW SERVERS
-		{
-			s:    `SHOW SERVERS`,
-			stmt: &influxql.ShowServersStatement{},
-		},
-
 		// SHOW GRANTS
 		{
 			s:    `SHOW GRANTS FOR jdoe`,
@@ -1106,6 +1143,33 @@ func TestParser_ParseStatement(t *testing.T) {
 			},
 		},
 
+		// DELETE statement
+		{
+			s:    `DELETE FROM src`,
+			stmt: &influxql.DeleteSeriesStatement{Sources: []influxql.Source{&influxql.Measurement{Name: "src"}}},
+		},
+		{
+			s: `DELETE WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+		{
+			s: `DELETE FROM src WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+
 		// DROP SERIES statement
 		{
 			s:    `DROP SERIES FROM src`,
@@ -1131,16 +1195,6 @@ func TestParser_ParseStatement(t *testing.T) {
 					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
 				},
 			},
-		},
-
-		// DROP SERVER statement
-		{
-			s:    `DROP META SERVER 123`,
-			stmt: &influxql.DropServerStatement{NodeID: 123, Meta: true},
-		},
-		{
-			s:    `DROP DATA SERVER 123`,
-			stmt: &influxql.DropServerStatement{NodeID: 123, Meta: false},
 		},
 
 		// SHOW CONTINUOUS QUERIES statement
@@ -1817,7 +1871,10 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT field1 FROM myseries LIMIT`, err: `found EOF, expected integer at line 1, char 35`},
 		{s: `SELECT field1 FROM myseries LIMIT 10.5`, err: `found 10.5, expected integer at line 1, char 35`},
 		{s: `SELECT count(max(value)) FROM myseries`, err: `expected field argument in count()`},
+		{s: `SELECT count(distinct('value')) FROM myseries`, err: `expected field argument in distinct()`},
+		{s: `SELECT distinct('value') FROM myseries`, err: `expected field argument in distinct()`},
 		{s: `SELECT min(max(value)) FROM myseries`, err: `expected field argument in min()`},
+		{s: `SELECT min(distinct(value)) FROM myseries`, err: `expected field argument in min()`},
 		{s: `SELECT max(max(value)) FROM myseries`, err: `expected field argument in max()`},
 		{s: `SELECT sum(max(value)) FROM myseries`, err: `expected field argument in sum()`},
 		{s: `SELECT first(max(value)) FROM myseries`, err: `expected field argument in first()`},
@@ -1862,9 +1919,10 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SELECT count(value) FROM foo group by time(1s) where host = 'hosta.influxdb.org'`, err: `aggregate functions with GROUP BY time require a WHERE time clause`},
 		{s: `SELECT count(value) FROM foo group by time`, err: `time() is a function and expects at least one argument`},
 		{s: `SELECT count(value) FROM foo group by 'time'`, err: `only time and tag dimensions allowed`},
-		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time()`, err: `time dimension expected one argument`},
-		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(b)`, err: `time dimension must have one duration argument`},
+		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time()`, err: `time dimension expected 1 or 2 arguments`},
+		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(b)`, err: `time dimension must have duration argument`},
 		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(1s), time(2s)`, err: `multiple time dimensions not allowed`},
+		{s: `SELECT count(value) FROM foo where time > now() and time < now() group by time(1s, b)`, err: `time dimension offset must be duration or now()`},
 		{s: `SELECT field1 FROM 12`, err: `found 12, expected identifier at line 1, char 20`},
 		{s: `SELECT 1000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000 FROM myseries`, err: `unable to parse integer at line 1, char 8`},
 		{s: `SELECT 10.5h FROM myseries`, err: `found h, expected FROM at line 1, char 12`},
@@ -1930,15 +1988,13 @@ func TestParser_ParseStatement(t *testing.T) {
 		//{s: `DELETE`, err: `found EOF, expected FROM at line 1, char 8`},
 		//{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
 		//{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
-		{s: `DELETE`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
-		{s: `DELETE FROM`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
-		{s: `DELETE FROM myseries WHERE`, err: `DELETE FROM is currently not supported. Use DROP SERIES or DROP MEASUREMENT instead`},
+		{s: `DELETE`, err: `found EOF, expected FROM, WHERE at line 1, char 8`},
+		{s: `DELETE FROM`, err: `found EOF, expected identifier at line 1, char 13`},
+		{s: `DELETE FROM myseries WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
 		{s: `DROP MEASUREMENT`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `DROP SERIES`, err: `found EOF, expected FROM, WHERE at line 1, char 13`},
 		{s: `DROP SERIES FROM`, err: `found EOF, expected identifier at line 1, char 18`},
 		{s: `DROP SERIES FROM src WHERE`, err: `found EOF, expected identifier, string, number, bool at line 1, char 28`},
-		{s: `DROP META SERVER`, err: `found EOF, expected integer at line 1, char 18`},
-		{s: `DROP DATA SERVER abc`, err: `found abc, expected integer at line 1, char 18`},
 		{s: `SHOW CONTINUOUS`, err: `found EOF, expected QUERIES at line 1, char 17`},
 		{s: `SHOW RETENTION`, err: `found EOF, expected POLICIES at line 1, char 16`},
 		{s: `SHOW RETENTION ON`, err: `found ON, expected POLICIES at line 1, char 16`},
@@ -1946,7 +2002,7 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `SHOW RETENTION POLICIES mydb`, err: `found mydb, expected ON at line 1, char 25`},
 		{s: `SHOW RETENTION POLICIES ON`, err: `found EOF, expected identifier at line 1, char 28`},
 		{s: `SHOW SHARD`, err: `found EOF, expected GROUPS at line 1, char 12`},
-		{s: `SHOW FOO`, err: `found FOO, expected CONTINUOUS, DATABASES, DIAGNOSTICS, FIELD, GRANTS, MEASUREMENTS, QUERIES, RETENTION, SERIES, SERVERS, SHARD, SHARDS, STATS, SUBSCRIPTIONS, TAG, USERS at line 1, char 6`},
+		{s: `SHOW FOO`, err: `found FOO, expected CONTINUOUS, DATABASES, DIAGNOSTICS, FIELD, GRANTS, MEASUREMENTS, QUERIES, RETENTION, SERIES, SHARD, SHARDS, STATS, SUBSCRIPTIONS, TAG, USERS at line 1, char 6`},
 		{s: `SHOW STATS FOR`, err: `found EOF, expected string at line 1, char 16`},
 		{s: `SHOW DIAGNOSTICS FOR`, err: `found EOF, expected string at line 1, char 22`},
 		{s: `SHOW GRANTS`, err: `found EOF, expected FOR at line 1, char 13`},
@@ -1959,7 +2015,7 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `CREATE CONTINUOUS QUERY`, err: `found EOF, expected identifier at line 1, char 25`},
 		{s: `CREATE CONTINUOUS QUERY cq ON db RESAMPLE FOR 5s BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(10s) END`, err: `FOR duration must be >= GROUP BY time duration: must be a minimum of 10s, got 5s`},
 		{s: `CREATE CONTINUOUS QUERY cq ON db RESAMPLE EVERY 10s FOR 5s BEGIN SELECT mean(value) INTO cpu_mean FROM cpu GROUP BY time(5s) END`, err: `FOR duration must be >= GROUP BY time duration: must be a minimum of 10s, got 5s`},
-		{s: `DROP FOO`, err: `found FOO, expected CONTINUOUS, DATA, MEASUREMENT, META, RETENTION, SERIES, SHARD, SUBSCRIPTION, USER at line 1, char 6`},
+		{s: `DROP FOO`, err: `found FOO, expected CONTINUOUS, MEASUREMENT, RETENTION, SERIES, SHARD, SUBSCRIPTION, USER at line 1, char 6`},
 		{s: `CREATE FOO`, err: `found FOO, expected CONTINUOUS, DATABASE, USER, RETENTION, SUBSCRIPTION at line 1, char 8`},
 		{s: `CREATE DATABASE`, err: `found EOF, expected identifier at line 1, char 17`},
 		{s: `CREATE DATABASE "testdb" WITH`, err: `found EOF, expected DURATION, NAME, REPLICATION, SHARD at line 1, char 31`},
@@ -2078,8 +2134,6 @@ func TestParser_ParseStatement(t *testing.T) {
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 3.14`, err: `found 3.14, expected integer at line 1, char 67`},
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 0`, err: `invalid value 0: must be 1 <= n <= 2147483647 at line 1, char 67`},
 		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION bad`, err: `found bad, expected integer at line 1, char 67`},
-		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 1 foo`, err: `found foo, expected SHARD at line 1, char 69`},
-		{s: `CREATE RETENTION POLICY policy1 ON testdb DURATION 1h REPLICATION 1 SHARD DURATION 30m foo`, err: `found foo, expected DEFAULT at line 1, char 88`},
 		{s: `ALTER`, err: `found EOF, expected RETENTION at line 1, char 7`},
 		{s: `ALTER RETENTION`, err: `found EOF, expected POLICY at line 1, char 17`},
 		{s: `ALTER RETENTION POLICY`, err: `found EOF, expected identifier at line 1, char 24`},
@@ -2409,6 +2463,58 @@ func TestQuoteIdent(t *testing.T) {
 	} {
 		if s := influxql.QuoteIdent(tt.ident...); tt.s != s {
 			t.Errorf("%d. %s: mismatch: %s != %s", i, tt.ident, tt.s, s)
+		}
+	}
+}
+
+// Ensure DeleteSeriesStatement can convert to a string
+func TestDeleteSeriesStatement_String(t *testing.T) {
+	var tests = []struct {
+		s    string
+		stmt influxql.Statement
+	}{
+		{
+			s:    `DELETE FROM src`,
+			stmt: &influxql.DeleteSeriesStatement{Sources: []influxql.Source{&influxql.Measurement{Name: "src"}}},
+		},
+		{
+			s: `DELETE FROM src WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+		{
+			s: `DELETE FROM src WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Sources: []influxql.Source{&influxql.Measurement{Name: "src"}},
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+		{
+			s: `DELETE WHERE host = 'hosta.influxdb.org'`,
+			stmt: &influxql.DeleteSeriesStatement{
+				Condition: &influxql.BinaryExpr{
+					Op:  influxql.EQ,
+					LHS: &influxql.VarRef{Val: "host"},
+					RHS: &influxql.StringLiteral{Val: "hosta.influxdb.org"},
+				},
+			},
+		},
+	}
+
+	for _, test := range tests {
+		s := test.stmt.String()
+		if s != test.s {
+			t.Errorf("error rendering string. expected %s, actual: %s", test.s, s)
 		}
 	}
 }

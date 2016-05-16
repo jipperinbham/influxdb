@@ -90,7 +90,8 @@ type Client interface {
 	Close() error
 }
 
-// NewHTTPClient creates a client interface from the given config.
+// NewHTTPClient returns a new Client from the provided config.
+// Client is safe for concurrent use by multiple goroutines.
 func NewHTTPClient(conf HTTPConfig) (Client, error) {
 	if conf.UserAgent == "" {
 		conf.UserAgent = "InfluxDBClient"
@@ -114,7 +115,7 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 		tr.TLSClientConfig = conf.TLSConfig
 	}
 	return &client{
-		url:       u,
+		url:       *u,
 		username:  conf.Username,
 		password:  conf.Password,
 		useragent: conf.UserAgent,
@@ -122,6 +123,7 @@ func NewHTTPClient(conf HTTPConfig) (Client, error) {
 			Timeout:   conf.Timeout,
 			Transport: tr,
 		},
+		transport: tr,
 	}, nil
 }
 
@@ -171,6 +173,7 @@ func (c *client) Ping(timeout time.Duration) (time.Duration, string, error) {
 
 // Close releases the client's resources.
 func (c *client) Close() error {
+	c.transport.CloseIdleConnections()
 	return nil
 }
 
@@ -210,12 +213,17 @@ func (uc *udpclient) Close() error {
 	return uc.conn.Close()
 }
 
+// client is safe for concurrent use as the fields are all read-only
+// once the client is instantiated.
 type client struct {
-	url        *url.URL
+	// N.B - if url.UserInfo is accessed in future modifications to the
+	// methods on client, you will need to syncronise access to url.
+	url        url.URL
 	username   string
 	password   string
 	useragent  string
 	httpClient *http.Client
+	transport  *http.Transport
 }
 
 type udpclient struct {
@@ -511,10 +519,17 @@ func (r *Response) Error() error {
 	return nil
 }
 
+// Message represents a user message.
+type Message struct {
+	Level string
+	Text  string
+}
+
 // Result represents a resultset returned from a single statement.
 type Result struct {
-	Series []models.Row
-	Err    string `json:"error,omitempty"`
+	Series   []models.Row
+	Messages []*Message
+	Err      string `json:"error,omitempty"`
 }
 
 func (uc *udpclient) Query(q Query) (*Response, error) {
@@ -526,7 +541,7 @@ func (c *client) Query(q Query) (*Response, error) {
 	u := c.url
 	u.Path = "query"
 
-	req, err := http.NewRequest("GET", u.String(), nil)
+	req, err := http.NewRequest("POST", u.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -561,7 +576,7 @@ func (c *client) Query(q Query) (*Response, error) {
 	}
 	// If we got a valid decode error, send that back
 	if decErr != nil {
-		return nil, decErr
+		return nil, fmt.Errorf("unable to decode json: received status code %d err: %s", resp.StatusCode, decErr)
 	}
 	// If we don't have an error in our json response, and didn't get statusOK
 	// then send back an error

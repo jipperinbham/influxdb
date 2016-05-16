@@ -80,19 +80,22 @@ type Service struct {
 
 // NewService returns a new instance of Service.
 func NewService(c Config) (*Service, error) {
+	// Use defaults where necessary.
+	d := c.WithDefaults()
+
 	s := &Service{
 		done:            make(chan struct{}),
-		tls:             c.TLSEnabled,
-		cert:            c.Certificate,
+		tls:             d.TLSEnabled,
+		cert:            d.Certificate,
 		err:             make(chan error),
-		BindAddress:     c.BindAddress,
-		Database:        c.Database,
-		RetentionPolicy: c.RetentionPolicy,
-		batchSize:       c.BatchSize,
-		batchPending:    c.BatchPending,
-		batchTimeout:    time.Duration(c.BatchTimeout),
+		BindAddress:     d.BindAddress,
+		Database:        d.Database,
+		RetentionPolicy: d.RetentionPolicy,
+		batchSize:       d.BatchSize,
+		batchPending:    d.BatchPending,
+		batchTimeout:    time.Duration(d.BatchTimeout),
 		Logger:          log.New(os.Stderr, "[opentsdb] ", log.LstdFlags),
-		LogPointErrors:  c.LogPointErrors,
+		LogPointErrors:  d.LogPointErrors,
 	}
 	return s, nil
 }
@@ -174,8 +177,11 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) { s.Logger = l }
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[opentsdb] ", log.LstdFlags)
+}
 
 // Err returns a channel for fatal errors that occur on the listener.
 func (s *Service) Err() <-chan error { return s.err }

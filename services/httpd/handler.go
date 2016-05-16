@@ -54,7 +54,7 @@ type Handler struct {
 	Version               string
 
 	MetaClient interface {
-		Database(name string) (*meta.DatabaseInfo, error)
+		Database(name string) *meta.DatabaseInfo
 		Authenticate(username, password string) (ui *meta.UserInfo, err error)
 		Users() []meta.UserInfo
 	}
@@ -63,7 +63,11 @@ type Handler struct {
 		AuthorizeQuery(u *meta.UserInfo, query *influxql.Query, database string) error
 	}
 
-	QueryExecutor influxql.QueryExecutor
+	WriteAuthorizer interface {
+		AuthorizeWrite(username, database string) error
+	}
+
+	QueryExecutor *influxql.QueryExecutor
 
 	PointsWriter interface {
 		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
@@ -98,6 +102,10 @@ func NewHandler(requireAuthentication, loggingEnabled, writeTrace bool, rowLimit
 		Route{
 			"query", // Query serving route.
 			"GET", "/query", true, true, h.serveQuery,
+		},
+		Route{
+			"query", // Query serving route.
+			"POST", "/query", true, true, h.serveQuery,
 		},
 		Route{
 			"write-options", // Satisfy CORS checks.
@@ -154,9 +162,9 @@ func (h *Handler) AddRoutes(routes ...Route) {
 		handler = cors(handler)
 		handler = requestID(handler)
 		if h.loggingEnabled && r.LoggingEnabled {
-			handler = logging(handler, r.Name, h.Logger)
+			handler = h.logging(handler, r.Name)
 		}
-		handler = recovery(handler, r.Name, h.Logger) // make sure recovery is always last
+		handler = h.recovery(handler, r.Name) // make sure recovery is always last
 
 		h.mux.Add(r.Method, r.Pattern, handler)
 
@@ -239,35 +247,28 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 		h.statMap.Add(statQueryRequestDuration, time.Since(start).Nanoseconds())
 	}(time.Now())
 
-	q := r.URL.Query()
-	pretty := q.Get("pretty") == "true"
+	pretty := r.FormValue("pretty") == "true"
 
-	qp := strings.TrimSpace(q.Get("q"))
+	qp := strings.TrimSpace(r.FormValue("q"))
 	if qp == "" {
 		httpError(w, `missing required parameter "q"`, pretty, http.StatusBadRequest)
 		return
 	}
 
-	epoch := strings.TrimSpace(q.Get("epoch"))
+	epoch := strings.TrimSpace(r.FormValue("epoch"))
 
 	p := influxql.NewParser(strings.NewReader(qp))
-	db := q.Get("db")
+	db := r.FormValue("db")
+
+	// Sanitize the request query params so it doesn't show up in the response logger.
+	// Do this before anything else so a parsing error doesn't leak passwords.
+	sanitize(r)
 
 	// Parse query from query string.
 	query, err := p.ParseQuery()
 	if err != nil {
 		httpError(w, "error parsing query: "+err.Error(), pretty, http.StatusBadRequest)
 		return
-	}
-
-	// Sanitize statements with passwords.
-	for _, s := range query.Statements {
-		switch stmt := s.(type) {
-		case *influxql.CreateUserStatement:
-			sanitize(r, stmt.Password)
-		case *influxql.SetPasswordUserStatement:
-			sanitize(r, stmt.Password)
-		}
 	}
 
 	// Check authorization.
@@ -282,10 +283,10 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	}
 
 	// Parse chunk size. Use default if not provided or unparsable.
-	chunked := (q.Get("chunked") == "true")
+	chunked := (r.FormValue("chunked") == "true")
 	chunkSize := DefaultChunkSize
 	if chunked {
-		if n, err := strconv.ParseInt(q.Get("chunk_size"), 10, 64); err == nil && int(n) > 0 {
+		if n, err := strconv.ParseInt(r.FormValue("chunk_size"), 10, 64); err == nil && int(n) > 0 {
 			chunkSize = int(n)
 		}
 	}
@@ -316,7 +317,8 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 	// Execute query.
 	w.Header().Add("Connection", "close")
 	w.Header().Add("content-type", "application/json")
-	results := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, closing)
+	readonly := r.Method == "GET" || r.Method == "HEAD"
+	results := h.QueryExecutor.ExecuteQuery(query, db, chunkSize, readonly, closing)
 
 	// if we're not chunking, this will be the in memory buffer for all results before sending to client
 	resp := Response{Results: make([]*influxql.Result, 0)}
@@ -391,6 +393,7 @@ func (h *Handler) serveQuery(w http.ResponseWriter, r *http.Request, user *meta.
 			// Append remaining rows as new rows.
 			r.Series = r.Series[rowsMerged:]
 			cr.Series = append(cr.Series, r.Series...)
+			cr.Messages = append(cr.Messages, r.Messages...)
 		} else {
 			resp.Results = append(resp.Results, r)
 		}
@@ -416,10 +419,7 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		return
 	}
 
-	if di, err := h.MetaClient.Database(database); err != nil {
-		resultError(w, influxql.Result{Err: fmt.Errorf("metastore database error: %s", err)}, http.StatusInternalServerError)
-		return
-	} else if di == nil {
+	if di := h.MetaClient.Database(database); di == nil {
 		resultError(w, influxql.Result{Err: fmt.Errorf("database not found: %q", database)}, http.StatusNotFound)
 		return
 	}
@@ -429,9 +429,11 @@ func (h *Handler) serveWrite(w http.ResponseWriter, r *http.Request, user *meta.
 		return
 	}
 
-	if h.requireAuthentication && !user.Authorize(influxql.WritePrivilege, database) {
-		resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
-		return
+	if h.requireAuthentication {
+		if err := h.WriteAuthorizer.AuthorizeWrite(user.Name, database); err != nil {
+			resultError(w, influxql.Result{Err: fmt.Errorf("%q user is not authorized to write to database %q", user.Name, database)}, http.StatusUnauthorized)
+			return
+		}
 	}
 
 	// Handle gzip decoding of the body
@@ -761,17 +763,17 @@ func requestID(inner http.Handler) http.Handler {
 	})
 }
 
-func logging(inner http.Handler, name string, weblog *log.Logger) http.Handler {
+func (h *Handler) logging(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		l := &responseLogger{w: w}
 		inner.ServeHTTP(l, r)
 		logLine := buildLogLine(l, r, start)
-		weblog.Println(logLine)
+		h.Logger.Println(logLine)
 	})
 }
 
-func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler {
+func (h *Handler) recovery(inner http.Handler, name string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		l := &responseLogger{w: w}
@@ -780,7 +782,7 @@ func recovery(inner http.Handler, name string, weblog *log.Logger) http.Handler 
 			if err := recover(); err != nil {
 				logLine := buildLogLine(l, r, start)
 				logLine = fmt.Sprintf(`%s [panic:%s]`, logLine, err)
-				weblog.Println(logLine)
+				h.Logger.Println(logLine)
 			}
 		}()
 

@@ -10,12 +10,12 @@ import (
 func Test_TimeEncoder(t *testing.T) {
 	enc := NewTimeEncoder()
 
-	x := []time.Time{}
+	x := []int64{}
 	now := time.Unix(0, 0)
-	x = append(x, now)
-	enc.Write(now)
+	x = append(x, now.UnixNano())
+	enc.Write(now.UnixNano())
 	for i := 1; i < 4; i++ {
-		x = append(x, now.Add(time.Duration(i)*time.Second))
+		x = append(x, now.Add(time.Duration(i)*time.Second).UnixNano())
 		enc.Write(x[i])
 	}
 
@@ -28,7 +28,8 @@ func Test_TimeEncoder(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected rle, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	for i, v := range x {
 		if !dec.Next() {
 			t.Fatalf("Next == false, expected true")
@@ -47,7 +48,8 @@ func Test_TimeEncoder_NoValues(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	if dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
 	}
@@ -55,7 +57,7 @@ func Test_TimeEncoder_NoValues(t *testing.T) {
 
 func Test_TimeEncoder_One(t *testing.T) {
 	enc := NewTimeEncoder()
-	tm := time.Unix(0, 0)
+	var tm int64
 
 	enc.Write(tm)
 	b, err := enc.Bytes()
@@ -67,7 +69,8 @@ func Test_TimeEncoder_One(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected uncompressed, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	if !dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
 	}
@@ -79,8 +82,8 @@ func Test_TimeEncoder_One(t *testing.T) {
 
 func Test_TimeEncoder_Two(t *testing.T) {
 	enc := NewTimeEncoder()
-	t1 := time.Unix(0, 0)
-	t2 := time.Unix(0, 1)
+	t1 := int64(0)
+	t2 := int64(1)
 	enc.Write(t1)
 	enc.Write(t2)
 
@@ -93,7 +96,8 @@ func Test_TimeEncoder_Two(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected rle, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	if !dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
 	}
@@ -113,9 +117,9 @@ func Test_TimeEncoder_Two(t *testing.T) {
 
 func Test_TimeEncoder_Three(t *testing.T) {
 	enc := NewTimeEncoder()
-	t1 := time.Unix(0, 0)
-	t2 := time.Unix(0, 1)
-	t3 := time.Unix(0, 3)
+	t1 := int64(0)
+	t2 := int64(1)
+	t3 := int64(3)
 
 	enc.Write(t1)
 	enc.Write(t2)
@@ -130,7 +134,8 @@ func Test_TimeEncoder_Three(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected rle, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	if !dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
 	}
@@ -158,8 +163,8 @@ func Test_TimeEncoder_Three(t *testing.T) {
 
 func Test_TimeEncoder_Large_Range(t *testing.T) {
 	enc := NewTimeEncoder()
-	t1 := time.Unix(0, 1442369134000000000)
-	t2 := time.Unix(0, 1442369135000000000)
+	t1 := int64(1442369134000000000)
+	t2 := int64(1442369135000000000)
 	enc.Write(t1)
 	enc.Write(t2)
 	b, err := enc.Bytes()
@@ -171,7 +176,8 @@ func Test_TimeEncoder_Large_Range(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected rle, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	if !dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
 	}
@@ -191,12 +197,12 @@ func Test_TimeEncoder_Large_Range(t *testing.T) {
 
 func Test_TimeEncoder_Uncompressed(t *testing.T) {
 	enc := NewTimeEncoder()
-	t1 := time.Unix(0, 0)
-	t2 := time.Unix(1, 0)
+	t1 := time.Unix(0, 0).UnixNano()
+	t2 := time.Unix(1, 0).UnixNano()
 
 	// about 36.5yrs in NS resolution is max range for compressed format
 	// This should cause the encoding to fallback to raw points
-	t3 := time.Unix(2, (2 << 59))
+	t3 := time.Unix(2, (2 << 59)).UnixNano()
 	enc.Write(t1)
 	enc.Write(t2)
 	enc.Write(t3)
@@ -214,7 +220,8 @@ func Test_TimeEncoder_Uncompressed(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected uncompressed, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	if !dec.Next() {
 		t.Fatalf("unexpected next value: got true, exp false")
 	}
@@ -242,9 +249,9 @@ func Test_TimeEncoder_Uncompressed(t *testing.T) {
 
 func Test_TimeEncoder_RLE(t *testing.T) {
 	enc := NewTimeEncoder()
-	var ts []time.Time
+	var ts []int64
 	for i := 0; i < 500; i++ {
-		ts = append(ts, time.Unix(int64(i), 0))
+		ts = append(ts, int64(i))
 	}
 
 	for _, v := range ts {
@@ -264,7 +271,8 @@ func Test_TimeEncoder_RLE(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	for i, v := range ts {
 		if !dec.Next() {
 			t.Fatalf("Next == false, expected true")
@@ -282,10 +290,10 @@ func Test_TimeEncoder_RLE(t *testing.T) {
 
 func Test_TimeEncoder_Reverse(t *testing.T) {
 	enc := NewTimeEncoder()
-	ts := []time.Time{
-		time.Unix(0, 3),
-		time.Unix(0, 2),
-		time.Unix(0, 0),
+	ts := []int64{
+		int64(3),
+		int64(2),
+		int64(0),
 	}
 
 	for _, v := range ts {
@@ -301,7 +309,8 @@ func Test_TimeEncoder_Reverse(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected uncompressed, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	i := 0
 	for dec.Next() {
 		if ts[i] != dec.Read() {
@@ -313,10 +322,10 @@ func Test_TimeEncoder_Reverse(t *testing.T) {
 
 func Test_TimeEncoder_220SecondDelta(t *testing.T) {
 	enc := NewTimeEncoder()
-	var ts []time.Time
+	var ts []int64
 	now := time.Now()
 	for i := 0; i < 220; i++ {
-		ts = append(ts, now.Add(time.Duration(i*60)*time.Second))
+		ts = append(ts, now.Add(time.Duration(i*60)*time.Second).UnixNano())
 	}
 
 	for _, v := range ts {
@@ -337,7 +346,8 @@ func Test_TimeEncoder_220SecondDelta(t *testing.T) {
 		t.Fatalf("Wrong encoding used: expected uncompressed, got %v", got)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	i := 0
 	for dec.Next() {
 		if ts[i] != dec.Read() {
@@ -359,9 +369,9 @@ func Test_TimeEncoder_Quick(t *testing.T) {
 	quick.Check(func(values []int64) bool {
 		// Write values to encoder.
 		enc := NewTimeEncoder()
-		exp := make([]time.Time, len(values))
+		exp := make([]int64, len(values))
 		for i, v := range values {
-			exp[i] = time.Unix(0, v)
+			exp[i] = int64(v)
 			enc.Write(exp[i])
 		}
 
@@ -372,8 +382,9 @@ func Test_TimeEncoder_Quick(t *testing.T) {
 		}
 
 		// Read values out of decoder.
-		got := make([]time.Time, 0, len(values))
-		dec := NewTimeDecoder(buf)
+		got := make([]int64, 0, len(values))
+		var dec TimeDecoder
+		dec.Init(buf)
 		for dec.Next() {
 			if err := dec.Error(); err != nil {
 				t.Fatal(err)
@@ -392,14 +403,14 @@ func Test_TimeEncoder_Quick(t *testing.T) {
 
 func Test_TimeEncoder_RLESeconds(t *testing.T) {
 	enc := NewTimeEncoder()
-	ts := make([]time.Time, 6)
+	ts := make([]int64, 6)
 
-	ts[0] = time.Unix(0, 1444448158000000000)
-	ts[1] = time.Unix(0, 1444448168000000000)
-	ts[2] = time.Unix(0, 1444448178000000000)
-	ts[3] = time.Unix(0, 1444448188000000000)
-	ts[4] = time.Unix(0, 1444448198000000000)
-	ts[5] = time.Unix(0, 1444448208000000000)
+	ts[0] = int64(1444448158000000000)
+	ts[1] = int64(1444448168000000000)
+	ts[2] = int64(1444448178000000000)
+	ts[3] = int64(1444448188000000000)
+	ts[4] = int64(1444448198000000000)
+	ts[5] = int64(1444448208000000000)
 
 	for _, v := range ts {
 		enc.Write(v)
@@ -414,7 +425,8 @@ func Test_TimeEncoder_RLESeconds(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	dec := NewTimeDecoder(b)
+	var dec TimeDecoder
+	dec.Init(b)
 	for i, v := range ts {
 		if !dec.Next() {
 			t.Fatalf("Next == false, expected true")
@@ -432,12 +444,12 @@ func Test_TimeEncoder_RLESeconds(t *testing.T) {
 
 func TestTimeEncoder_Count_Uncompressed(t *testing.T) {
 	enc := NewTimeEncoder()
-	t1 := time.Unix(0, 0)
-	t2 := time.Unix(1, 0)
+	t1 := time.Unix(0, 0).UnixNano()
+	t2 := time.Unix(1, 0).UnixNano()
 
 	// about 36.5yrs in NS resolution is max range for compressed format
 	// This should cause the encoding to fallback to raw points
-	t3 := time.Unix(2, (2 << 59))
+	t3 := time.Unix(2, (2 << 59)).UnixNano()
 	enc.Write(t1)
 	enc.Write(t2)
 	enc.Write(t3)
@@ -458,14 +470,14 @@ func TestTimeEncoder_Count_Uncompressed(t *testing.T) {
 
 func TestTimeEncoder_Count_RLE(t *testing.T) {
 	enc := NewTimeEncoder()
-	ts := make([]time.Time, 6)
+	ts := make([]int64, 6)
 
-	ts[0] = time.Unix(0, 1444448158000000000)
-	ts[1] = time.Unix(0, 1444448168000000000)
-	ts[2] = time.Unix(0, 1444448178000000000)
-	ts[3] = time.Unix(0, 1444448188000000000)
-	ts[4] = time.Unix(0, 1444448198000000000)
-	ts[5] = time.Unix(0, 1444448208000000000)
+	ts[0] = int64(1444448158000000000)
+	ts[1] = int64(1444448168000000000)
+	ts[2] = int64(1444448178000000000)
+	ts[3] = int64(1444448188000000000)
+	ts[4] = int64(1444448198000000000)
+	ts[5] = int64(1444448208000000000)
 
 	for _, v := range ts {
 		enc.Write(v)
@@ -487,9 +499,9 @@ func TestTimeEncoder_Count_RLE(t *testing.T) {
 
 func TestTimeEncoder_Count_Simple8(t *testing.T) {
 	enc := NewTimeEncoder()
-	t1 := time.Unix(0, 0)
-	t2 := time.Unix(0, 1)
-	t3 := time.Unix(0, 3)
+	t1 := int64(0)
+	t2 := int64(1)
+	t3 := int64(3)
 
 	enc.Write(t1)
 	enc.Write(t2)
@@ -515,9 +527,9 @@ func TestTimeEncoder_Count_Simple8(t *testing.T) {
 
 func BenchmarkTimeEncoder(b *testing.B) {
 	enc := NewTimeEncoder()
-	x := make([]time.Time, 1024)
+	x := make([]int64, 1024)
 	for i := 0; i < len(x); i++ {
-		x[i] = time.Now()
+		x[i] = time.Now().UnixNano()
 		enc.Write(x[i])
 	}
 
@@ -527,21 +539,45 @@ func BenchmarkTimeEncoder(b *testing.B) {
 	}
 }
 
-func BenchmarkTimeDecoder(b *testing.B) {
-	x := make([]time.Time, 1024)
+func BenchmarkTimeDecoder_Packed(b *testing.B) {
+	x := make([]int64, 1024)
 	enc := NewTimeEncoder()
 	for i := 0; i < len(x); i++ {
-		x[i] = time.Now()
+		x[i] = time.Now().UnixNano()
 		enc.Write(x[i])
 	}
 	bytes, _ := enc.Bytes()
 
 	b.ResetTimer()
 
+	b.StopTimer()
+	var dec TimeDecoder
+	b.StartTimer()
+
 	for i := 0; i < b.N; i++ {
-		b.StopTimer()
-		dec := NewTimeDecoder(bytes)
-		b.StartTimer()
+		dec.Init(bytes)
+		for dec.Next() {
+		}
+	}
+}
+
+func BenchmarkTimeDecoder_RLE(b *testing.B) {
+	x := make([]int64, 1024)
+	enc := NewTimeEncoder()
+	for i := 0; i < len(x); i++ {
+		x[i] = int64(i * 10)
+		enc.Write(x[i])
+	}
+	bytes, _ := enc.Bytes()
+
+	b.ResetTimer()
+
+	b.StopTimer()
+	var dec TimeDecoder
+	b.StartTimer()
+
+	for i := 0; i < b.N; i++ {
+		dec.Init(bytes)
 		for dec.Next() {
 		}
 	}

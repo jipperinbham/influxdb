@@ -3,6 +3,7 @@ package collectd // import "github.com/influxdata/influxdb/services/collectd"
 import (
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -63,13 +64,15 @@ type Service struct {
 
 // NewService returns a new instance of the collectd service.
 func NewService(c Config) *Service {
-	s := &Service{
-		Config: &c,
+	s := Service{
+		// Use defaults where necessary.
+		Config: c.WithDefaults(),
+
 		Logger: log.New(os.Stderr, "[collectd] ", log.LstdFlags),
 		err:    make(chan error),
 	}
 
-	return s
+	return &s
 }
 
 // Open starts the service.
@@ -165,9 +168,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[collectd] ", log.LstdFlags)
 }
 
 // SetTypes sets collectd types db.

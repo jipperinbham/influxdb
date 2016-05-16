@@ -98,7 +98,7 @@ func (c *bufCursor) nextAt(seek int64) interface{} {
 
 // statsBufferCopyIntervalN is the number of points that are read before
 // copying the stats buffer to the iterator's stats field. This is used to
-// amortize the cost of using a mutex when updating stats. 
+// amortize the cost of using a mutex when updating stats.
 const statsBufferCopyIntervalN = 100
 
 {{range .}}
@@ -108,7 +108,7 @@ type {{.name}}Iterator struct {
 	aux   []cursorAt
 	conds struct {
 		names []string
-		curs  []*bufCursor
+		curs  []cursorAt
 	}
 	opt   influxql.IteratorOptions
 
@@ -120,7 +120,7 @@ type {{.name}}Iterator struct {
 	statsBuf  influxql.IteratorStats
 }
 
-func new{{.Name}}Iterator(name string, tags influxql.Tags, opt influxql.IteratorOptions, cur {{.name}}Cursor, aux []cursorAt, conds []*bufCursor, condNames []string) *{{.name}}Iterator {
+func new{{.Name}}Iterator(name string, tags influxql.Tags, opt influxql.IteratorOptions, cur {{.name}}Cursor, aux []cursorAt, conds []cursorAt, condNames []string) *{{.name}}Iterator {
 	itr := &{{.name}}Iterator{
 		cur:   cur,
 		aux:   aux,
@@ -149,7 +149,7 @@ func new{{.Name}}Iterator(name string, tags influxql.Tags, opt influxql.Iterator
 }
 
 // Next returns the next point from the iterator.
-func (itr *{{.name}}Iterator) Next() *influxql.{{.Name}}Point {
+func (itr *{{.name}}Iterator) Next() (*influxql.{{.Name}}Point, error) {
 	for {
 		seek := tsdb.EOF
 
@@ -172,13 +172,13 @@ func (itr *{{.name}}Iterator) Next() *influxql.{{.Name}}Point {
 		// Exit if we have no more points or we are outside our time range.
 		if itr.point.Time == tsdb.EOF {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if itr.opt.Ascending && itr.point.Time > itr.opt.EndTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		} else if !itr.opt.Ascending && itr.point.Time < itr.opt.StartTime {
 			itr.copyStats()
-			return nil
+			return nil, nil
 		}
 
 		// Read from each auxiliary cursor.
@@ -204,7 +204,7 @@ func (itr *{{.name}}Iterator) Next() *influxql.{{.Name}}Point {
 			itr.copyStats()
 		}
 
-		return &itr.point
+		return &itr.point, nil
 	}
 }
 
@@ -226,6 +226,44 @@ func (itr *{{.name}}Iterator) Stats() influxql.IteratorStats {
 // Close closes the iterator.
 func (itr *{{.name}}Iterator) Close() error { return nil }
 
+// {{.name}}LimitIterator
+type {{.name}}LimitIterator struct {
+	input influxql.{{.Name}}Iterator
+	opt   influxql.IteratorOptions
+	n     int
+}
+
+func new{{.Name}}LimitIterator(input influxql.{{.Name}}Iterator, opt influxql.IteratorOptions) *{{.name}}LimitIterator {
+	return &{{.name}}LimitIterator{
+		input: input,
+		opt:   opt,
+	}
+}
+
+func (itr *{{.name}}LimitIterator) Stats() influxql.IteratorStats { return itr.input.Stats() }
+func (itr *{{.name}}LimitIterator) Close() error                  { return itr.input.Close() }
+
+func (itr *{{.name}}LimitIterator) Next() (*influxql.{{.Name}}Point, error) {
+	for {
+		// Check if we are beyond the limit.
+		if (itr.n-itr.opt.Offset) > itr.opt.Limit {
+			return nil, nil
+		}
+
+		// Read the next point.
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
+		}
+
+		// Increment counter.
+		itr.n++
+
+		// Offsets are handled by a higher level iterator so return all points.
+		return p, nil
+	}
+}
+
 // {{.name}}Cursor represents an object for iterating over a single {{.name}} field.
 type {{.name}}Cursor interface {
 	cursor
@@ -246,6 +284,8 @@ type {{.name}}AscendingCursor struct {
 	}
 
 	tsm struct {
+		tdec      TimeDecoder
+		vdec      {{.Name}}Decoder
 		buf       []{{.Name}}Value
 		values    []{{.Name}}Value
 		pos       int
@@ -263,7 +303,7 @@ func new{{.Name}}AscendingCursor(seek int64, cacheValues Values, tsmKeyCursor *K
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]{{.Name}}Value, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -308,7 +348,7 @@ func (c *{{.name}}AscendingCursor) next{{.Name}}() (int64, {{.Type}}) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -335,7 +375,7 @@ func (c *{{.name}}AscendingCursor) nextTSM() {
 	c.tsm.pos++
 	if c.tsm.pos >= len(c.tsm.values) {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}
@@ -350,6 +390,8 @@ type {{.name}}DescendingCursor struct {
 	}
 
 	tsm struct {
+		tdec      TimeDecoder
+		vdec      {{.Name}}Decoder
 		buf       []{{.Name}}Value
 		values    []{{.Name}}Value
 		pos       int
@@ -370,7 +412,7 @@ func new{{.Name}}DescendingCursor(seek int64, cacheValues Values, tsmKeyCursor *
 
 	c.tsm.keyCursor = tsmKeyCursor
 	c.tsm.buf = make([]{{.Name}}Value, 10)
-	c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(c.tsm.buf)
+	c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 	c.tsm.pos = sort.Search(len(c.tsm.values), func(i int) bool {
 		return c.tsm.values[i].UnixNano() >= seek
 	})
@@ -418,7 +460,7 @@ func (c *{{.name}}DescendingCursor) next{{.Name}}() (int64, {{.Type}}) {
 	if ckey == tkey {
 		c.nextCache()
 		c.nextTSM()
-		return tkey, tvalue
+		return ckey, cvalue
 	}
 
 	// Buffered cache key precedes that in TSM file.
@@ -445,7 +487,7 @@ func (c *{{.name}}DescendingCursor) nextTSM() {
 	c.tsm.pos--
 	if c.tsm.pos < 0 {
 		c.tsm.keyCursor.Next()
-		c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(c.tsm.buf)
+		c.tsm.values, _ = c.tsm.keyCursor.Read{{.Name}}Block(&c.tsm.tdec, &c.tsm.vdec, &c.tsm.buf)
 		if len(c.tsm.values) == 0 {
 			return
 		}

@@ -3,7 +3,9 @@ package tsm1
 import (
 	"expvar"
 	"fmt"
+	"io"
 	"log"
+	"math"
 	"os"
 	"sort"
 	"sync"
@@ -33,13 +35,15 @@ func newEntry() *entry {
 
 // add adds the given values to the entry.
 func (e *entry) add(values []Value) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	// See if the new values are sorted or contain duplicate timestamps
-	var prevTime int64
+	var (
+		prevTime int64
+		needSort bool
+	)
+
 	for _, v := range values {
 		if v.UnixNano() <= prevTime {
-			e.needSort = true
+			needSort = true
 			break
 		}
 		prevTime = v.UnixNano()
@@ -47,6 +51,10 @@ func (e *entry) add(values []Value) {
 
 	// if there are existing values make sure they're all less than the first of
 	// the new values being added
+	e.mu.Lock()
+	if needSort {
+		e.needSort = needSort
+	}
 	if len(e.values) == 0 {
 		e.values = values
 	} else {
@@ -57,6 +65,7 @@ func (e *entry) add(values []Value) {
 		}
 		e.values = append(e.values, values...)
 	}
+	e.mu.Unlock()
 }
 
 // deduplicate sorts and orders the entry's values. If values are already deduped and
@@ -72,10 +81,27 @@ func (e *entry) deduplicate() {
 	e.needSort = false
 }
 
+// count returns number of values for this entry
 func (e *entry) count() int {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return len(e.values)
+	n := len(e.values)
+	e.mu.RUnlock()
+	return n
+}
+
+// filter removes all values between min and max inclusive
+func (e *entry) filter(min, max int64) {
+	e.mu.Lock()
+	e.values = e.values.Filter(min, max)
+	e.mu.Unlock()
+}
+
+// size returns the size of this entry in bytes
+func (e *entry) size() int {
+	e.mu.RLock()
+	sz := e.values.Size()
+	e.mu.RUnlock()
+	return sz
 }
 
 // Statistics gathered by the Cache.
@@ -177,10 +203,10 @@ func (c *Cache) WriteMulti(values map[string][]Value) error {
 	}
 	c.mu.RUnlock()
 
-	c.mu.Lock()
 	for k, v := range values {
-		c.write(k, v)
+		c.entry(k).add(v)
 	}
+	c.mu.Lock()
 	c.size = newSize
 	c.mu.Unlock()
 
@@ -298,12 +324,38 @@ func (c *Cache) Values(key string) Values {
 
 // Delete will remove the keys from the cache
 func (c *Cache) Delete(keys []string) {
+	c.DeleteRange(keys, math.MinInt64, math.MaxInt64)
+}
+
+// DeleteRange will remove the values for all keys containing points
+// between min and max from the cache.
+func (c *Cache) DeleteRange(keys []string, min, max int64) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	for _, k := range keys {
-		delete(c.store, k)
+		origSize := c.store[k].size()
+		if min == math.MinInt64 && max == math.MaxInt64 {
+			c.size -= uint64(origSize)
+			delete(c.store, k)
+			continue
+		}
+
+		c.store[k].filter(min, max)
+		if c.store[k].count() == 0 {
+			delete(c.store, k)
+			c.size -= uint64(origSize)
+			continue
+		}
+
+		c.size -= uint64(origSize - c.store[k].size())
 	}
+}
+
+func (c *Cache) SetMaxSize(size uint64) {
+	c.mu.Lock()
+	c.maxSize = size
+	c.mu.Unlock()
 }
 
 // merged returns a copy of hot and snapshot values. The copy will be merged, deduped, and
@@ -402,6 +454,17 @@ func (c *Cache) write(key string, values []Value) {
 	e.add(values)
 }
 
+func (c *Cache) entry(key string) *entry {
+	c.mu.Lock()
+	e, ok := c.store[key]
+	if !ok {
+		e = newEntry()
+		c.store[key] = e
+	}
+	c.mu.Unlock()
+	return e
+}
+
 // CacheLoader processes a set of WAL segment files, and loads a cache with the data
 // contained within those files.  Processing of the supplied files take place in the
 // order they exist in the files slice.
@@ -457,6 +520,8 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 					if err := cache.WriteMulti(t.Values); err != nil {
 						return err
 					}
+				case *DeleteRangeWALEntry:
+					cache.DeleteRange(t.Keys, t.Min, t.Max)
 				case *DeleteWALEntry:
 					cache.Delete(t.Keys)
 				}
@@ -468,6 +533,12 @@ func (cl *CacheLoader) Load(cache *Cache) error {
 		}
 	}
 	return nil
+}
+
+// SetLogOutput sets the logger used for all messages. It must not be called
+// after the Open method has been called.
+func (cl *CacheLoader) SetLogOutput(w io.Writer) {
+	cl.Logger = log.New(w, "[cacheloader] ", log.LstdFlags)
 }
 
 // Updates the age statistic

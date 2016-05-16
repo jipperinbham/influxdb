@@ -2,6 +2,7 @@ package run
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -53,10 +54,12 @@ type Server struct {
 	BindAddress string
 	Listener    net.Listener
 
+	Logger *log.Logger
+
 	MetaClient *meta.Client
 
 	TSDBStore     *tsdb.Store
-	QueryExecutor *cluster.QueryExecutor
+	QueryExecutor *influxql.QueryExecutor
 	PointsWriter  *cluster.PointsWriter
 	Subscriber    *subscriber.Service
 	Replicator    *replicator.Service
@@ -87,6 +90,10 @@ type Server struct {
 	tcpAddr string
 
 	config *Config
+
+	// logOutput is the writer to which all services should be configured to
+	// write logs to after appension.
+	logOutput io.Writer
 }
 
 // NewServer returns a new instance of Server built from a config.
@@ -117,11 +124,8 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 		}
 	}
 
-	// Check to see if there is a raft db, if so, error out with a message
-	// to downgrade, export, and then import the meta data
-	raftFile := filepath.Join(c.Meta.Dir, "raft.db")
-	if _, err := os.Stat(raftFile); err == nil {
-		return nil, fmt.Errorf("detected %s. To proceed, you'll need to either 1) downgrade to v0.11.x, export your metadata, upgrade to the current version again, and then import the metadata or 2) delete the file, which will effectively reset your database. For more assistance with the upgrade, see: https://docs.influxdata.com/influxdb/v0.12/administration/upgrading/", raftFile)
+	if err := raftDBExists(c.Meta.Dir); err != nil {
+		return nil, err
 	}
 
 	// In 0.10.0 bind-address got moved to the top level. Check
@@ -135,6 +139,8 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 
 		BindAddress: bind,
 
+		Logger: log.New(os.Stderr, "", log.LstdFlags),
+
 		MetaClient: meta.NewClient(c.Meta),
 
 		Monitor: monitor.New(c.Monitor),
@@ -145,7 +151,8 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 		httpUseTLS:  c.HTTPD.HTTPSEnabled,
 		tcpAddr:     bind,
 
-		config: c,
+		config:    c,
+		logOutput: os.Stderr,
 	}
 
 	if err := s.MetaClient.Open(); err != nil {
@@ -172,18 +179,21 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	s.Replicator.PointsWriter = s.PointsWriter
 
 	// Initialize query executor.
-	s.QueryExecutor = cluster.NewQueryExecutor()
-	s.QueryExecutor.MetaClient = s.MetaClient
-	s.QueryExecutor.TSDBStore = s.TSDBStore
-	s.QueryExecutor.Monitor = s.Monitor
-	s.QueryExecutor.PointsWriter = s.PointsWriter
+	s.QueryExecutor = influxql.NewQueryExecutor()
+	s.QueryExecutor.StatementExecutor = &cluster.StatementExecutor{
+		MetaClient:        s.MetaClient,
+		TSDBStore:         cluster.LocalTSDBStore{Store: s.TSDBStore},
+		Monitor:           s.Monitor,
+		PointsWriter:      s.PointsWriter,
+		MaxSelectPointN:   c.Cluster.MaxSelectPointN,
+		MaxSelectSeriesN:  c.Cluster.MaxSelectSeriesN,
+		MaxSelectBucketsN: c.Cluster.MaxSelectBucketsN,
+	}
 	s.QueryExecutor.QueryTimeout = time.Duration(c.Cluster.QueryTimeout)
-	s.QueryExecutor.QueryManager = influxql.DefaultQueryManager(c.Cluster.MaxConcurrentQueries)
-	s.QueryExecutor.MaxSelectPointN = c.Cluster.MaxSelectPointN
-	s.QueryExecutor.MaxSelectSeriesN = c.Cluster.MaxSelectSeriesN
-	s.QueryExecutor.MaxSelectBucketsN = c.Cluster.MaxSelectBucketsN
+	s.QueryExecutor.LogQueriesAfter = time.Duration(c.Cluster.LogQueriesAfter)
+	s.QueryExecutor.MaxConcurrentQueries = c.Cluster.MaxConcurrentQueries
 	if c.Data.QueryLogEnabled {
-		s.QueryExecutor.LogOutput = os.Stderr
+		s.QueryExecutor.Logger = log.New(os.Stderr, "[query] ", log.LstdFlags)
 	}
 	s.QueryExecutor.Replicator = s.Replicator
 	s.Replicator.QueryExecutor = s.QueryExecutor
@@ -194,13 +204,12 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	s.Monitor.Branch = s.buildInfo.Branch
 	s.Monitor.BuildTime = s.buildInfo.Time
 	s.Monitor.PointsWriter = (*monitorPointsWriter)(s.PointsWriter)
-
 	return s, nil
 }
 
 func (s *Server) appendClusterService(c cluster.Config) {
 	srv := cluster.NewService(c)
-	srv.TSDBStore = s.TSDBStore
+	srv.TSDBStore = cluster.LocalTSDBStore{Store: s.TSDBStore}
 	s.Services = append(s.Services, srv)
 	s.ClusterService = srv
 }
@@ -218,6 +227,13 @@ func (s *Server) appendCopierService() {
 	srv.TSDBStore = s.TSDBStore
 	s.Services = append(s.Services, srv)
 	s.CopierService = srv
+}
+
+// SetLogOutput sets the logger used for all messages. It must not be called
+// after the Open method has been called.
+func (s *Server) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(os.Stderr, "", log.LstdFlags)
+	s.logOutput = w
 }
 
 // Err returns an error channel that multiplexes all out of band errors received from all services.
@@ -247,18 +263,22 @@ func (s *Server) Open() error {
 	s.appendAdminService(s.config.Admin)
 	s.appendContinuousQueryService(s.config.ContinuousQuery)
 	s.appendHTTPDService(s.config.HTTPD)
-	s.appendCollectdService(s.config.Collectd)
-	if err := s.appendOpenTSDBService(s.config.OpenTSDB); err != nil {
-		return err
-	}
-	for _, g := range s.config.UDPs {
-		s.appendUDPService(g)
-	}
 	s.appendRetentionPolicyService(s.config.Retention)
-	for _, g := range s.config.Graphites {
-		if err := s.appendGraphiteService(g); err != nil {
+	for _, i := range s.config.GraphiteInputs {
+		if err := s.appendGraphiteService(i); err != nil {
 			return err
 		}
+	}
+	for _, i := range s.config.CollectdInputs {
+		s.appendCollectdService(i)
+	}
+	for _, i := range s.config.OpenTSDBInputs {
+		if err := s.appendOpenTSDBService(i); err != nil {
+			return err
+		}
+	}
+	for _, i := range s.config.UDPInputs {
+		s.appendUDPService(i)
 	}
 
 	s.Subscriber.MetaClient = s.MetaClient
@@ -269,6 +289,21 @@ func (s *Server) Open() error {
 	s.ClusterService.Listener = mux.Listen(cluster.MuxHeader)
 	s.SnapshotterService.Listener = mux.Listen(snapshotter.MuxHeader)
 	s.CopierService.Listener = mux.Listen(copier.MuxHeader)
+
+	// Configure logging for all services and clients.
+	w := s.logOutput
+	s.MetaClient.SetLogOutput(w)
+	s.TSDBStore.SetLogOutput(w)
+	s.QueryExecutor.SetLogOutput(w)
+	s.PointsWriter.SetLogOutput(w)
+	s.Subscriber.SetLogOutput(w)
+	for _, svc := range s.Services {
+		svc.SetLogOutput(w)
+	}
+	s.ClusterService.SetLogOutput(w)
+	s.SnapshotterService.SetLogOutput(w)
+	s.CopierService.SetLogOutput(w)
+	s.Monitor.SetLogOutput(w)
 
 	// Open TSDB store.
 	if err := s.TSDBStore.Open(); err != nil {
@@ -331,8 +366,8 @@ func (s *Server) Close() error {
 		s.PointsWriter.Close()
 	}
 
-	if s.QueryExecutor.QueryManager != nil {
-		s.QueryExecutor.QueryManager.Close()
+	if s.QueryExecutor != nil {
+		s.QueryExecutor.Close()
 	}
 
 	// Close the TSDBStore, no more reads or writes at this point
@@ -371,11 +406,7 @@ func (s *Server) startServerReporting() {
 
 // reportServer reports anonymous statistics about the system.
 func (s *Server) reportServer() {
-	dis, err := s.MetaClient.Databases()
-	if err != nil {
-		log.Printf("failed to retrieve databases for reporting: %s", err.Error())
-		return
-	}
+	dis := s.MetaClient.Databases()
 	numDatabases := len(dis)
 
 	numMeasurements := 0
@@ -396,11 +427,6 @@ func (s *Server) reportServer() {
 	}
 
 	clusterID := s.MetaClient.ClusterID()
-	if err != nil {
-		log.Printf("failed to retrieve cluster ID for reporting: %s", err.Error())
-		return
-	}
-
 	cl := client.New("")
 	usage := client.Usage{
 		Product: "influxdb",
@@ -420,7 +446,7 @@ func (s *Server) reportServer() {
 		},
 	}
 
-	log.Printf("Sending anonymous usage statistics to m.influxdb.com")
+	s.Logger.Printf("Sending anonymous usage statistics to m.influxdb.com")
 
 	go cl.Save(usage)
 }
@@ -457,6 +483,7 @@ func (s *Server) MetaServers() []string {
 
 // Service represents a service attached to the server.
 type Service interface {
+	SetLogOutput(w io.Writer)
 	Open() error
 	Close() error
 }

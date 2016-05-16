@@ -3,6 +3,7 @@ package subscriber // import "github.com/influxdata/influxdb/services/subscriber
 import (
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"net/url"
 	"os"
@@ -39,7 +40,7 @@ type subEntry struct {
 type Service struct {
 	subs       map[subEntry]PointsWriter
 	MetaClient interface {
-		Databases() ([]meta.DatabaseInfo, error)
+		Databases() []meta.DatabaseInfo
 		WaitForDataChanged() chan struct{}
 	}
 	NewPointsWriter func(u url.URL) (PointsWriter, error)
@@ -108,9 +109,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[subscriber] ", log.LstdFlags)
 }
 
 func (s *Service) waitForMetaUpdates() {
@@ -136,10 +138,7 @@ func (s *Service) waitForMetaUpdates() {
 
 // Update will start new and stop deleted subscriptions.
 func (s *Service) Update() error {
-	dbis, err := s.MetaClient.Databases()
-	if err != nil {
-		return err
-	}
+	dbis := s.MetaClient.Databases()
 	allEntries := make(map[subEntry]bool, 0)
 	// Add in new subscriptions
 	for _, dbi := range dbis {

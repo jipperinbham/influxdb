@@ -12,13 +12,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/influxdata/influxdb/influxql/internal"
+	internal "github.com/influxdata/influxdb/influxql/internal"
 )
 
 // DefaultStatsInterval is the default value for IteratorEncoder.StatsInterval.
@@ -27,7 +26,7 @@ const DefaultStatsInterval = 10 * time.Second
 // FloatIterator represents a stream of float points.
 type FloatIterator interface {
 	Iterator
-	Next() *FloatPoint
+	Next() (*FloatPoint, error)
 }
 
 // newFloatIterators converts a slice of Iterator to a slice of FloatIterator.
@@ -68,43 +67,46 @@ func (itr *bufFloatIterator) Stats() IteratorStats { return itr.itr.Stats() }
 func (itr *bufFloatIterator) Close() error { return itr.itr.Close() }
 
 // peek returns the next point without removing it from the iterator.
-func (itr *bufFloatIterator) peek() *FloatPoint {
-	p := itr.Next()
+func (itr *bufFloatIterator) peek() (*FloatPoint, error) {
+	p, err := itr.Next()
+	if err != nil {
+		return nil, err
+	}
 	itr.unread(p)
-	return p
+	return p, nil
 }
 
 // peekTime returns the time of the next point.
 // Returns zero time if no more points available.
-func (itr *bufFloatIterator) peekTime() int64 {
-	p := itr.peek()
-	if p == nil {
-		return ZeroTime
+func (itr *bufFloatIterator) peekTime() (int64, error) {
+	p, err := itr.peek()
+	if p == nil || err != nil {
+		return ZeroTime, err
 	}
-	return p.Time
+	return p.Time, nil
 }
 
 // Next returns the current buffer, if exists, or calls the underlying iterator.
-func (itr *bufFloatIterator) Next() *FloatPoint {
-	if itr.buf != nil {
-		buf := itr.buf
+func (itr *bufFloatIterator) Next() (*FloatPoint, error) {
+	buf := itr.buf
+	if buf != nil {
 		itr.buf = nil
-		return buf
+		return buf, nil
 	}
 	return itr.itr.Next()
 }
 
 // NextInWindow returns the next value if it is between [startTime, endTime).
 // If the next value is outside the range then it is moved to the buffer.
-func (itr *bufFloatIterator) NextInWindow(startTime, endTime int64) *FloatPoint {
-	v := itr.Next()
-	if v == nil {
-		return nil
-	} else if v.Time < startTime || v.Time >= endTime {
+func (itr *bufFloatIterator) NextInWindow(startTime, endTime int64) (*FloatPoint, error) {
+	v, err := itr.Next()
+	if v == nil || err != nil {
+		return nil, err
+	} else if t := v.Time; t >= endTime || t < startTime {
 		itr.unread(v)
-		return nil
+		return nil, nil
 	}
-	return v
+	return v, nil
 }
 
 // unread sets v to the buffer. It is read on the next call to Next().
@@ -166,7 +168,7 @@ func (itr *floatMergeIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *floatMergeIterator) Next() *FloatPoint {
+func (itr *floatMergeIterator) Next() (*FloatPoint, error) {
 	// Initialize the heap. This needs to be done lazily on the first call to this iterator
 	// so that iterator initialization done through the Select() call returns quickly.
 	// Queries can only be interrupted after the Select() call completes so any operations
@@ -176,7 +178,9 @@ func (itr *floatMergeIterator) Next() *FloatPoint {
 		items := itr.heap.items
 		itr.heap.items = make([]*floatMergeHeapItem, 0, len(items))
 		for _, item := range items {
-			if item.itr.peek() == nil {
+			if p, err := item.itr.peek(); err != nil {
+				return nil, err
+			} else if p == nil {
 				continue
 			}
 			itr.heap.items = append(itr.heap.items, item)
@@ -189,19 +193,25 @@ func (itr *floatMergeIterator) Next() *FloatPoint {
 		// Retrieve the next iterator if we don't have one.
 		if itr.curr == nil {
 			if len(itr.heap.items) == 0 {
-				return nil
+				return nil, nil
 			}
 			itr.curr = heap.Pop(itr.heap).(*floatMergeHeapItem)
 
 			// Read point and set current window.
-			p := itr.curr.itr.Next()
+			p, err := itr.curr.itr.Next()
+			if err != nil {
+				return nil, err
+			}
 			itr.window.name, itr.window.tags = p.Name, p.Tags.ID()
 			itr.window.startTime, itr.window.endTime = itr.heap.opt.Window(p.Time)
-			return p
+			return p, nil
 		}
 
 		// Read the next point from the current iterator.
-		p := itr.curr.itr.Next()
+		p, err := itr.curr.itr.Next()
+		if err != nil {
+			return nil, err
+		}
 
 		// If there are no more points then remove iterator from heap and find next.
 		if p == nil {
@@ -211,13 +221,13 @@ func (itr *floatMergeIterator) Next() *FloatPoint {
 
 		// Check if the point is inside of our current window.
 		inWindow := true
-		if itr.window.name != p.Name {
+		if window := itr.window; window.name != p.Name {
 			inWindow = false
-		} else if itr.window.tags != p.Tags.ID() {
+		} else if window.tags != p.Tags.ID() {
 			inWindow = false
-		} else if itr.heap.opt.Ascending && p.Time >= itr.window.endTime {
+		} else if opt := itr.heap.opt; opt.Ascending && p.Time >= window.endTime {
 			inWindow = false
-		} else if !itr.heap.opt.Ascending && p.Time < itr.window.startTime {
+		} else if !opt.Ascending && p.Time < window.startTime {
 			inWindow = false
 		}
 
@@ -229,7 +239,7 @@ func (itr *floatMergeIterator) Next() *FloatPoint {
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -243,7 +253,14 @@ type floatMergeHeap struct {
 func (h floatMergeHeap) Len() int      { return len(h.items) }
 func (h floatMergeHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
 func (h floatMergeHeap) Less(i, j int) bool {
-	x, y := h.items[i].itr.peek(), h.items[j].itr.peek()
+	x, err := h.items[i].itr.peek()
+	if err != nil {
+		return true
+	}
+	y, err := h.items[j].itr.peek()
+	if err != nil {
+		return false
+	}
 
 	if h.opt.Ascending {
 		if x.Name != y.Name {
@@ -282,6 +299,7 @@ func (h *floatMergeHeap) Pop() interface{} {
 
 type floatMergeHeapItem struct {
 	itr *bufFloatIterator
+	err error
 }
 
 // floatSortedMergeIterator is an iterator that sorts and merges multiple iterators into one.
@@ -289,6 +307,8 @@ type floatSortedMergeIterator struct {
 	inputs []FloatIterator
 	opt    IteratorOptions
 	heap   floatSortedMergeHeap
+	init   bool
+	point  FloatPoint
 }
 
 // newFloatSortedMergeIterator returns an instance of floatSortedMergeIterator.
@@ -299,18 +319,11 @@ func newFloatSortedMergeIterator(inputs []FloatIterator, opt IteratorOptions) It
 		opt:    opt,
 	}
 
-	// Initialize heap.
+	// Initialize heap items.
 	for _, input := range inputs {
-		// Read next point.
-		p := input.Next()
-		if p == nil {
-			continue
-		}
-
 		// Append to the heap.
-		itr.heap = append(itr.heap, &floatSortedMergeHeapItem{point: p, itr: input, ascending: opt.Ascending})
+		itr.heap = append(itr.heap, &floatSortedMergeHeapItem{itr: input, ascending: opt.Ascending})
 	}
-	heap.Init(&itr.heap)
 
 	return itr
 }
@@ -333,27 +346,49 @@ func (itr *floatSortedMergeIterator) Close() error {
 }
 
 // Next returns the next points from the iterator.
-func (itr *floatSortedMergeIterator) Next() *FloatPoint { return itr.pop() }
+func (itr *floatSortedMergeIterator) Next() (*FloatPoint, error) { return itr.pop() }
 
 // pop returns the next point from the heap.
 // Reads the next point from item's cursor and puts it back on the heap.
-func (itr *floatSortedMergeIterator) pop() *FloatPoint {
+func (itr *floatSortedMergeIterator) pop() (*FloatPoint, error) {
+	// Initialize the heap. See the MergeIterator to see why this has to be done lazily.
+	if !itr.init {
+		items := itr.heap
+		itr.heap = make([]*floatSortedMergeHeapItem, 0, len(items))
+		for _, item := range items {
+			var err error
+			if item.point, err = item.itr.Next(); err != nil {
+				return nil, err
+			} else if item.point == nil {
+				continue
+			}
+			itr.heap = append(itr.heap, item)
+		}
+		heap.Init(&itr.heap)
+		itr.init = true
+	}
+
 	if len(itr.heap) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Read the next item from the heap.
 	item := heap.Pop(&itr.heap).(*floatSortedMergeHeapItem)
+	if item.err != nil {
+		return nil, item.err
+	} else if item.point == nil {
+		return nil, nil
+	}
 
 	// Copy the point for return.
 	p := item.point.Clone()
 
 	// Read the next item from the cursor. Push back to heap if one exists.
-	if item.point = item.itr.Next(); item.point != nil {
+	if item.point, item.err = item.itr.Next(); item.point != nil {
 		heap.Push(&itr.heap, item)
 	}
 
-	return p
+	return p, nil
 }
 
 // floatSortedMergeHeap represents a heap of floatSortedMergeHeapItems.
@@ -395,6 +430,7 @@ func (h *floatSortedMergeHeap) Pop() interface{} {
 
 type floatSortedMergeHeapItem struct {
 	point     *FloatPoint
+	err       error
 	itr       FloatIterator
 	ascending bool
 }
@@ -426,11 +462,11 @@ func (itr *floatLimitIterator) Stats() IteratorStats { return itr.input.Stats() 
 func (itr *floatLimitIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next point from the iterator.
-func (itr *floatLimitIterator) Next() *FloatPoint {
+func (itr *floatLimitIterator) Next() (*FloatPoint, error) {
 	for {
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Reset window and counter if a new window is encountered.
@@ -452,12 +488,12 @@ func (itr *floatLimitIterator) Next() *FloatPoint {
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
 			// If there's no interval, no groups, and a single source then simply exit.
 			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil
+				return nil, nil
 			}
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -467,7 +503,7 @@ type floatFillIterator struct {
 	startTime int64
 	endTime   int64
 	auxFields []interface{}
-	done      bool
+	init      bool
 	opt       IteratorOptions
 
 	window struct {
@@ -488,9 +524,9 @@ func newFloatFillIterator(input FloatIterator, expr Expr, opt IteratorOptions) *
 	var startTime, endTime int64
 	if opt.Ascending {
 		startTime, _ = opt.Window(opt.StartTime)
-		_, endTime = opt.Window(opt.EndTime)
+		endTime, _ = opt.Window(opt.EndTime)
 	} else {
-		_, startTime = opt.Window(opt.EndTime)
+		startTime, _ = opt.Window(opt.EndTime)
 		endTime, _ = opt.Window(opt.StartTime)
 	}
 
@@ -499,36 +535,40 @@ func newFloatFillIterator(input FloatIterator, expr Expr, opt IteratorOptions) *
 		auxFields = make([]interface{}, len(opt.Aux))
 	}
 
-	itr := &floatFillIterator{
+	return &floatFillIterator{
 		input:     newBufFloatIterator(input),
 		startTime: startTime,
 		endTime:   endTime,
 		auxFields: auxFields,
 		opt:       opt,
 	}
-
-	p := itr.input.peek()
-	if p != nil {
-		itr.window.name, itr.window.tags = p.Name, p.Tags
-		itr.window.time = itr.startTime
-	} else {
-		itr.window.time = itr.endTime
-	}
-	return itr
 }
 
 func (itr *floatFillIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *floatFillIterator) Close() error         { return itr.input.Close() }
 
-func (itr *floatFillIterator) Next() *FloatPoint {
-	p := itr.input.Next()
+func (itr *floatFillIterator) Next() (*FloatPoint, error) {
+	if !itr.init {
+		p, err := itr.input.peek()
+		if p == nil || err != nil {
+			return nil, err
+		}
+		itr.window.name, itr.window.tags = p.Name, p.Tags
+		itr.window.time = itr.startTime
+		itr.init = true
+	}
+
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if the next point is outside of our window or is nil.
 	for p == nil || p.Name != itr.window.name || p.Tags.ID() != itr.window.tags.ID() {
 		// If we are inside of an interval, unread the point and continue below to
 		// constructing a new point.
 		if itr.opt.Ascending {
-			if itr.window.time < itr.endTime {
+			if itr.window.time <= itr.endTime {
 				itr.input.unread(p)
 				p = nil
 				break
@@ -544,7 +584,7 @@ func (itr *floatFillIterator) Next() *FloatPoint {
 		// We are *not* in a current interval. If there is no next point,
 		// we are at the end of all intervals.
 		if p == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Set the new interval.
@@ -555,7 +595,7 @@ func (itr *floatFillIterator) Next() *FloatPoint {
 	}
 
 	// Check if the point is our next expected point.
-	if p == nil || p.Time > itr.window.time {
+	if p == nil || (itr.opt.Ascending && p.Time > itr.window.time) || (!itr.opt.Ascending && p.Time < itr.window.time) {
 		if p != nil {
 			itr.input.unread(p)
 		}
@@ -592,7 +632,7 @@ func (itr *floatFillIterator) Next() *FloatPoint {
 	} else {
 		itr.window.time = p.Time - int64(itr.opt.Interval.Duration)
 	}
-	return p
+	return p, nil
 }
 
 // floatIntervalIterator represents a float implementation of IntervalIterator.
@@ -608,13 +648,13 @@ func newFloatIntervalIterator(input FloatIterator, opt IteratorOptions) *floatIn
 func (itr *floatIntervalIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *floatIntervalIterator) Close() error         { return itr.input.Close() }
 
-func (itr *floatIntervalIterator) Next() *FloatPoint {
-	p := itr.input.Next()
-	if p == nil {
-		return p
+func (itr *floatIntervalIterator) Next() (*FloatPoint, error) {
+	p, err := itr.input.Next()
+	if p == nil || err != nil {
+		return nil, err
 	}
 	p.Time, _ = itr.opt.Window(p.Time)
-	return p
+	return p, nil
 }
 
 // floatInterruptIterator represents a float implementation of InterruptIterator.
@@ -631,15 +671,15 @@ func newFloatInterruptIterator(input FloatIterator, closing <-chan struct{}) *fl
 func (itr *floatInterruptIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *floatInterruptIterator) Close() error         { return itr.input.Close() }
 
-func (itr *floatInterruptIterator) Next() *FloatPoint {
-	// Only check if the channel is closed every 256 points. This
-	// intentionally checks on both 0 and 256 so that if the iterator
+func (itr *floatInterruptIterator) Next() (*FloatPoint, error) {
+	// Only check if the channel is closed every N points. This
+	// intentionally checks on both 0 and N so that if the iterator
 	// has been interrupted before the first point is emitted it will
 	// not emit any points.
-	if itr.count&0x100 == 0 {
+	if itr.count&0xFF == 0xFF {
 		select {
 		case <-itr.closing:
-			return nil
+			return nil, nil
 		default:
 			// Reset iterator count to zero and fall through to emit the next point.
 			itr.count = 0
@@ -651,10 +691,16 @@ func (itr *floatInterruptIterator) Next() *FloatPoint {
 	return itr.input.Next()
 }
 
+// auxFloatPoint represents a combination of a point and an error for the AuxIterator.
+type auxFloatPoint struct {
+	point *FloatPoint
+	err   error
+}
+
 // floatAuxIterator represents a float implementation of AuxIterator.
 type floatAuxIterator struct {
 	input      *bufFloatIterator
-	output     chan *FloatPoint
+	output     chan auxFloatPoint
 	fields     auxIteratorFields
 	background bool
 }
@@ -662,7 +708,7 @@ type floatAuxIterator struct {
 func newFloatAuxIterator(input FloatIterator, seriesKeys SeriesList, opt IteratorOptions) *floatAuxIterator {
 	return &floatAuxIterator{
 		input:  newBufFloatIterator(input),
-		output: make(chan *FloatPoint, 1),
+		output: make(chan auxFloatPoint, 1),
 		fields: newAuxIteratorFields(seriesKeys, opt),
 	}
 }
@@ -670,13 +716,16 @@ func newFloatAuxIterator(input FloatIterator, seriesKeys SeriesList, opt Iterato
 func (itr *floatAuxIterator) Background() {
 	itr.background = true
 	itr.Start()
-	go drainIterator(itr)
+	go DrainIterator(itr)
 }
 
-func (itr *floatAuxIterator) Start()                        { go itr.stream() }
-func (itr *floatAuxIterator) Stats() IteratorStats          { return itr.input.Stats() }
-func (itr *floatAuxIterator) Close() error                  { return itr.input.Close() }
-func (itr *floatAuxIterator) Next() *FloatPoint             { return <-itr.output }
+func (itr *floatAuxIterator) Start()               { go itr.stream() }
+func (itr *floatAuxIterator) Stats() IteratorStats { return itr.input.Stats() }
+func (itr *floatAuxIterator) Close() error         { return itr.input.Close() }
+func (itr *floatAuxIterator) Next() (*FloatPoint, error) {
+	p := <-itr.output
+	return p.point, p.err
+}
 func (itr *floatAuxIterator) Iterator(name string) Iterator { return itr.fields.iterator(name) }
 
 func (itr *floatAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
@@ -708,13 +757,17 @@ func (itr *floatAuxIterator) ExpandSources(sources Sources) (Sources, error) {
 func (itr *floatAuxIterator) stream() {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
+		p, err := itr.input.Next()
+		if err != nil {
+			itr.output <- auxFloatPoint{err: err}
+			itr.fields.sendError(err)
+			break
+		} else if p == nil {
 			break
 		}
 
 		// Send point to output and to each field iterator.
-		itr.output <- p
+		itr.output <- auxFloatPoint{point: p}
 		if ok := itr.fields.send(p); !ok && itr.background {
 			break
 		}
@@ -726,7 +779,12 @@ func (itr *floatAuxIterator) stream() {
 
 // floatChanIterator represents a new instance of floatChanIterator.
 type floatChanIterator struct {
-	buf  *FloatPoint
+	buf struct {
+		i      int
+		filled bool
+		points [2]FloatPoint
+	}
+	err  error
 	cond *sync.Cond
 	done bool
 }
@@ -749,7 +807,7 @@ func (itr *floatChanIterator) setBuf(name string, tags Tags, time int64, value i
 
 	// Wait for either the iterator to be done (so we don't have to set the value)
 	// or for the buffer to have been read and ready for another write.
-	for !itr.done && itr.buf != nil {
+	for !itr.done && itr.buf.filled {
 		itr.cond.Wait()
 	}
 
@@ -762,38 +820,58 @@ func (itr *floatChanIterator) setBuf(name string, tags Tags, time int64, value i
 
 	switch v := value.(type) {
 	case float64:
-		itr.buf = &FloatPoint{Name: name, Tags: tags, Time: time, Value: v}
+		itr.buf.points[itr.buf.i] = FloatPoint{Name: name, Tags: tags, Time: time, Value: v}
 
 	case int64:
-		itr.buf = &FloatPoint{Name: name, Tags: tags, Time: time, Value: float64(v)}
+		itr.buf.points[itr.buf.i] = FloatPoint{Name: name, Tags: tags, Time: time, Value: float64(v)}
 
 	default:
-		itr.buf = &FloatPoint{Name: name, Tags: tags, Time: time, Nil: true}
+		itr.buf.points[itr.buf.i] = FloatPoint{Name: name, Tags: tags, Time: time, Nil: true}
 	}
+	itr.buf.filled = true
+
 	// Signal to all waiting goroutines that a new value is ready to read.
 	itr.cond.Signal()
 	return true
 }
 
-func (itr *floatChanIterator) Next() *FloatPoint {
+func (itr *floatChanIterator) setErr(err error) {
 	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+	itr.err = err
+
+	// Signal to all waiting goroutines that a new value is ready to read.
+	itr.cond.Signal()
+}
+
+func (itr *floatChanIterator) Next() (*FloatPoint, error) {
+	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+
+	// Check for an error and return one if there.
+	if itr.err != nil {
+		return nil, itr.err
+	}
 
 	// Wait until either a value is available in the buffer or
 	// the iterator is closed.
-	for !itr.done && itr.buf == nil {
+	for !itr.done && !itr.buf.filled {
 		itr.cond.Wait()
+	}
+
+	// Return nil once the channel is done and the buffer is empty.
+	if itr.done && !itr.buf.filled {
+		return nil, nil
 	}
 
 	// Always read from the buffer if it exists, even if the iterator
 	// is closed. This prevents the last value from being truncated by
 	// the parent iterator.
-	p := itr.buf
-	itr.buf = nil
+	p := &itr.buf.points[itr.buf.i]
+	itr.buf.i = (itr.buf.i + 1) % len(itr.buf.points)
+	itr.buf.filled = false
 	itr.cond.Signal()
-
-	// Do not defer the unlock so we don't create an unnecessary allocation.
-	itr.cond.L.Unlock()
-	return p
+	return p, nil
 }
 
 // floatReduceFloatIterator executes a reducer for every interval and buffers the result.
@@ -811,19 +889,20 @@ func (itr *floatReduceFloatIterator) Stats() IteratorStats { return itr.input.St
 func (itr *floatReduceFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *floatReduceFloatIterator) Next() *FloatPoint {
+func (itr *floatReduceFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // floatReduceFloatPoint stores the reduced data for a name/tag combination.
@@ -836,16 +915,22 @@ type floatReduceFloatPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *floatReduceFloatIterator) reduce() []FloatPoint {
+func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceFloatPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -877,7 +962,9 @@ func (itr *floatReduceFloatIterator) reduce() []FloatPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
@@ -894,10 +981,10 @@ func (itr *floatReduceFloatIterator) reduce() []FloatPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// floatStreamFloatIterator
+// floatStreamFloatIterator streams inputs into the iterator and emits points gradually.
 type floatStreamFloatIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, FloatPointEmitter)
@@ -906,6 +993,7 @@ type floatStreamFloatIterator struct {
 	points []FloatPoint
 }
 
+// newFloatStreamFloatIterator returns a new instance of floatStreamFloatIterator.
 func newFloatStreamFloatIterator(input FloatIterator, createFn func() (FloatPointAggregator, FloatPointEmitter), opt IteratorOptions) *floatStreamFloatIterator {
 	return &floatStreamFloatIterator{
 		input:  newBufFloatIterator(input),
@@ -922,29 +1010,30 @@ func (itr *floatStreamFloatIterator) Stats() IteratorStats { return itr.input.St
 func (itr *floatStreamFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *floatStreamFloatIterator) Next() *FloatPoint {
+func (itr *floatStreamFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *floatStreamFloatIterator) reduce() []FloatPoint {
+func (itr *floatStreamFloatIterator) reduce() ([]FloatPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -979,7 +1068,7 @@ func (itr *floatStreamFloatIterator) reduce() []FloatPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -1003,13 +1092,18 @@ func (itr *floatExprIterator) Close() error {
 	return nil
 }
 
-func (itr *floatExprIterator) Next() *FloatPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *floatExprIterator) Next() (*FloatPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // floatExprFunc creates or modifies a point by combining two
@@ -1033,19 +1127,20 @@ func (itr *floatReduceIntegerIterator) Stats() IteratorStats { return itr.input.
 func (itr *floatReduceIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *floatReduceIntegerIterator) Next() *IntegerPoint {
+func (itr *floatReduceIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // floatReduceIntegerPoint stores the reduced data for a name/tag combination.
@@ -1058,16 +1153,22 @@ type floatReduceIntegerPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *floatReduceIntegerIterator) reduce() []IntegerPoint {
+func (itr *floatReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceIntegerPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -1099,7 +1200,9 @@ func (itr *floatReduceIntegerIterator) reduce() []IntegerPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
@@ -1116,10 +1219,10 @@ func (itr *floatReduceIntegerIterator) reduce() []IntegerPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// floatStreamIntegerIterator
+// floatStreamIntegerIterator streams inputs into the iterator and emits points gradually.
 type floatStreamIntegerIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, IntegerPointEmitter)
@@ -1128,6 +1231,7 @@ type floatStreamIntegerIterator struct {
 	points []IntegerPoint
 }
 
+// newFloatStreamIntegerIterator returns a new instance of floatStreamIntegerIterator.
 func newFloatStreamIntegerIterator(input FloatIterator, createFn func() (FloatPointAggregator, IntegerPointEmitter), opt IteratorOptions) *floatStreamIntegerIterator {
 	return &floatStreamIntegerIterator{
 		input:  newBufFloatIterator(input),
@@ -1144,29 +1248,30 @@ func (itr *floatStreamIntegerIterator) Stats() IteratorStats { return itr.input.
 func (itr *floatStreamIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *floatStreamIntegerIterator) Next() *IntegerPoint {
+func (itr *floatStreamIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *floatStreamIntegerIterator) reduce() []IntegerPoint {
+func (itr *floatStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -1201,7 +1306,7 @@ func (itr *floatStreamIntegerIterator) reduce() []IntegerPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -1225,13 +1330,18 @@ func (itr *floatIntegerExprIterator) Close() error {
 	return nil
 }
 
-func (itr *floatIntegerExprIterator) Next() *IntegerPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *floatIntegerExprIterator) Next() (*IntegerPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // floatIntegerExprFunc creates or modifies a point by combining two
@@ -1255,19 +1365,20 @@ func (itr *floatReduceStringIterator) Stats() IteratorStats { return itr.input.S
 func (itr *floatReduceStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *floatReduceStringIterator) Next() *StringPoint {
+func (itr *floatReduceStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // floatReduceStringPoint stores the reduced data for a name/tag combination.
@@ -1280,16 +1391,22 @@ type floatReduceStringPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *floatReduceStringIterator) reduce() []StringPoint {
+func (itr *floatReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceStringPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -1321,7 +1438,9 @@ func (itr *floatReduceStringIterator) reduce() []StringPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
@@ -1338,10 +1457,10 @@ func (itr *floatReduceStringIterator) reduce() []StringPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// floatStreamStringIterator
+// floatStreamStringIterator streams inputs into the iterator and emits points gradually.
 type floatStreamStringIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, StringPointEmitter)
@@ -1350,6 +1469,7 @@ type floatStreamStringIterator struct {
 	points []StringPoint
 }
 
+// newFloatStreamStringIterator returns a new instance of floatStreamStringIterator.
 func newFloatStreamStringIterator(input FloatIterator, createFn func() (FloatPointAggregator, StringPointEmitter), opt IteratorOptions) *floatStreamStringIterator {
 	return &floatStreamStringIterator{
 		input:  newBufFloatIterator(input),
@@ -1366,29 +1486,30 @@ func (itr *floatStreamStringIterator) Stats() IteratorStats { return itr.input.S
 func (itr *floatStreamStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *floatStreamStringIterator) Next() *StringPoint {
+func (itr *floatStreamStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *floatStreamStringIterator) reduce() []StringPoint {
+func (itr *floatStreamStringIterator) reduce() ([]StringPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -1423,7 +1544,7 @@ func (itr *floatStreamStringIterator) reduce() []StringPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -1447,13 +1568,18 @@ func (itr *floatStringExprIterator) Close() error {
 	return nil
 }
 
-func (itr *floatStringExprIterator) Next() *StringPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *floatStringExprIterator) Next() (*StringPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // floatStringExprFunc creates or modifies a point by combining two
@@ -1477,19 +1603,20 @@ func (itr *floatReduceBooleanIterator) Stats() IteratorStats { return itr.input.
 func (itr *floatReduceBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *floatReduceBooleanIterator) Next() *BooleanPoint {
+func (itr *floatReduceBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // floatReduceBooleanPoint stores the reduced data for a name/tag combination.
@@ -1502,16 +1629,22 @@ type floatReduceBooleanPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *floatReduceBooleanIterator) reduce() []BooleanPoint {
+func (itr *floatReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceBooleanPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -1543,7 +1676,9 @@ func (itr *floatReduceBooleanIterator) reduce() []BooleanPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
@@ -1560,10 +1695,10 @@ func (itr *floatReduceBooleanIterator) reduce() []BooleanPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// floatStreamBooleanIterator
+// floatStreamBooleanIterator streams inputs into the iterator and emits points gradually.
 type floatStreamBooleanIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, BooleanPointEmitter)
@@ -1572,6 +1707,7 @@ type floatStreamBooleanIterator struct {
 	points []BooleanPoint
 }
 
+// newFloatStreamBooleanIterator returns a new instance of floatStreamBooleanIterator.
 func newFloatStreamBooleanIterator(input FloatIterator, createFn func() (FloatPointAggregator, BooleanPointEmitter), opt IteratorOptions) *floatStreamBooleanIterator {
 	return &floatStreamBooleanIterator{
 		input:  newBufFloatIterator(input),
@@ -1588,29 +1724,30 @@ func (itr *floatStreamBooleanIterator) Stats() IteratorStats { return itr.input.
 func (itr *floatStreamBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *floatStreamBooleanIterator) Next() *BooleanPoint {
+func (itr *floatStreamBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *floatStreamBooleanIterator) reduce() []BooleanPoint {
+func (itr *floatStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -1645,7 +1782,7 @@ func (itr *floatStreamBooleanIterator) reduce() []BooleanPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -1669,13 +1806,18 @@ func (itr *floatBooleanExprIterator) Close() error {
 	return nil
 }
 
-func (itr *floatBooleanExprIterator) Next() *BooleanPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *floatBooleanExprIterator) Next() (*BooleanPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // floatBooleanExprFunc creates or modifies a point by combining two
@@ -1698,12 +1840,14 @@ func (itr *floatTransformIterator) Stats() IteratorStats { return itr.input.Stat
 func (itr *floatTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *floatTransformIterator) Next() *FloatPoint {
-	p := itr.input.Next()
-	if p != nil {
+func (itr *floatTransformIterator) Next() (*FloatPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
 		p = itr.fn(p)
 	}
-	return p
+	return p, nil
 }
 
 // floatTransformFunc creates or modifies a point.
@@ -1725,12 +1869,14 @@ func (itr *floatBoolTransformIterator) Stats() IteratorStats { return itr.input.
 func (itr *floatBoolTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *floatBoolTransformIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
-	if p != nil {
-		return itr.fn(p)
+func (itr *floatBoolTransformIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
+		return itr.fn(p), nil
 	}
-	return nil
+	return nil, nil
 }
 
 // floatBoolTransformFunc creates or modifies a point.
@@ -1762,19 +1908,18 @@ func (itr *floatDedupeIterator) Stats() IteratorStats { return itr.input.Stats()
 func (itr *floatDedupeIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next unique point from the input iterator.
-func (itr *floatDedupeIterator) Next() *FloatPoint {
+func (itr *floatDedupeIterator) Next() (*FloatPoint, error) {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Serialize to bytes to store in lookup.
 		buf, err := proto.Marshal(encodeFloatPoint(p))
 		if err != nil {
-			log.Println("error marshaling dedupe point:", err)
-			continue
+			return nil, err
 		}
 
 		// If the point has already been output then move to the next point.
@@ -1784,26 +1929,24 @@ func (itr *floatDedupeIterator) Next() *FloatPoint {
 
 		// Otherwise mark it as emitted and return point.
 		itr.m[string(buf)] = struct{}{}
-		return p
+		return p, nil
 	}
 }
 
 // floatReaderIterator represents an iterator that streams from a reader.
 type floatReaderIterator struct {
-	r     io.Reader
-	dec   *FloatPointDecoder
-	first *FloatPoint
+	r   io.Reader
+	dec *FloatPointDecoder
 }
 
 // newFloatReaderIterator returns a new instance of floatReaderIterator.
-func newFloatReaderIterator(r io.Reader, first *FloatPoint, stats IteratorStats) *floatReaderIterator {
+func newFloatReaderIterator(r io.Reader, stats IteratorStats) *floatReaderIterator {
 	dec := NewFloatPointDecoder(r)
 	dec.stats = stats
 
 	return &floatReaderIterator{
-		r:     r,
-		dec:   dec,
-		first: first,
+		r:   r,
+		dec: dec,
 	}
 }
 
@@ -1819,31 +1962,23 @@ func (itr *floatReaderIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *floatReaderIterator) Next() *FloatPoint {
-	// Send first point if it hasn't been sent yet.
-	if itr.first != nil {
-		p := itr.first
-		itr.first = nil
-		return p
-	}
-
+func (itr *floatReaderIterator) Next() (*FloatPoint, error) {
 	// OPTIMIZE(benbjohnson): Reuse point on iterator.
 
 	// Unmarshal next point.
 	p := &FloatPoint{}
 	if err := itr.dec.DecodeFloatPoint(p); err == io.EOF {
-		return nil
+		return nil, nil
 	} else if err != nil {
-		log.Printf("error reading iterator point: %s", err)
-		return nil
+		return nil, err
 	}
-	return p
+	return p, nil
 }
 
 // IntegerIterator represents a stream of integer points.
 type IntegerIterator interface {
 	Iterator
-	Next() *IntegerPoint
+	Next() (*IntegerPoint, error)
 }
 
 // newIntegerIterators converts a slice of Iterator to a slice of IntegerIterator.
@@ -1881,43 +2016,46 @@ func (itr *bufIntegerIterator) Stats() IteratorStats { return itr.itr.Stats() }
 func (itr *bufIntegerIterator) Close() error { return itr.itr.Close() }
 
 // peek returns the next point without removing it from the iterator.
-func (itr *bufIntegerIterator) peek() *IntegerPoint {
-	p := itr.Next()
+func (itr *bufIntegerIterator) peek() (*IntegerPoint, error) {
+	p, err := itr.Next()
+	if err != nil {
+		return nil, err
+	}
 	itr.unread(p)
-	return p
+	return p, nil
 }
 
 // peekTime returns the time of the next point.
 // Returns zero time if no more points available.
-func (itr *bufIntegerIterator) peekTime() int64 {
-	p := itr.peek()
-	if p == nil {
-		return ZeroTime
+func (itr *bufIntegerIterator) peekTime() (int64, error) {
+	p, err := itr.peek()
+	if p == nil || err != nil {
+		return ZeroTime, err
 	}
-	return p.Time
+	return p.Time, nil
 }
 
 // Next returns the current buffer, if exists, or calls the underlying iterator.
-func (itr *bufIntegerIterator) Next() *IntegerPoint {
-	if itr.buf != nil {
-		buf := itr.buf
+func (itr *bufIntegerIterator) Next() (*IntegerPoint, error) {
+	buf := itr.buf
+	if buf != nil {
 		itr.buf = nil
-		return buf
+		return buf, nil
 	}
 	return itr.itr.Next()
 }
 
 // NextInWindow returns the next value if it is between [startTime, endTime).
 // If the next value is outside the range then it is moved to the buffer.
-func (itr *bufIntegerIterator) NextInWindow(startTime, endTime int64) *IntegerPoint {
-	v := itr.Next()
-	if v == nil {
-		return nil
-	} else if v.Time < startTime || v.Time >= endTime {
+func (itr *bufIntegerIterator) NextInWindow(startTime, endTime int64) (*IntegerPoint, error) {
+	v, err := itr.Next()
+	if v == nil || err != nil {
+		return nil, err
+	} else if t := v.Time; t >= endTime || t < startTime {
 		itr.unread(v)
-		return nil
+		return nil, nil
 	}
-	return v
+	return v, nil
 }
 
 // unread sets v to the buffer. It is read on the next call to Next().
@@ -1979,7 +2117,7 @@ func (itr *integerMergeIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *integerMergeIterator) Next() *IntegerPoint {
+func (itr *integerMergeIterator) Next() (*IntegerPoint, error) {
 	// Initialize the heap. This needs to be done lazily on the first call to this iterator
 	// so that iterator initialization done through the Select() call returns quickly.
 	// Queries can only be interrupted after the Select() call completes so any operations
@@ -1989,7 +2127,9 @@ func (itr *integerMergeIterator) Next() *IntegerPoint {
 		items := itr.heap.items
 		itr.heap.items = make([]*integerMergeHeapItem, 0, len(items))
 		for _, item := range items {
-			if item.itr.peek() == nil {
+			if p, err := item.itr.peek(); err != nil {
+				return nil, err
+			} else if p == nil {
 				continue
 			}
 			itr.heap.items = append(itr.heap.items, item)
@@ -2002,19 +2142,25 @@ func (itr *integerMergeIterator) Next() *IntegerPoint {
 		// Retrieve the next iterator if we don't have one.
 		if itr.curr == nil {
 			if len(itr.heap.items) == 0 {
-				return nil
+				return nil, nil
 			}
 			itr.curr = heap.Pop(itr.heap).(*integerMergeHeapItem)
 
 			// Read point and set current window.
-			p := itr.curr.itr.Next()
+			p, err := itr.curr.itr.Next()
+			if err != nil {
+				return nil, err
+			}
 			itr.window.name, itr.window.tags = p.Name, p.Tags.ID()
 			itr.window.startTime, itr.window.endTime = itr.heap.opt.Window(p.Time)
-			return p
+			return p, nil
 		}
 
 		// Read the next point from the current iterator.
-		p := itr.curr.itr.Next()
+		p, err := itr.curr.itr.Next()
+		if err != nil {
+			return nil, err
+		}
 
 		// If there are no more points then remove iterator from heap and find next.
 		if p == nil {
@@ -2024,13 +2170,13 @@ func (itr *integerMergeIterator) Next() *IntegerPoint {
 
 		// Check if the point is inside of our current window.
 		inWindow := true
-		if itr.window.name != p.Name {
+		if window := itr.window; window.name != p.Name {
 			inWindow = false
-		} else if itr.window.tags != p.Tags.ID() {
+		} else if window.tags != p.Tags.ID() {
 			inWindow = false
-		} else if itr.heap.opt.Ascending && p.Time >= itr.window.endTime {
+		} else if opt := itr.heap.opt; opt.Ascending && p.Time >= window.endTime {
 			inWindow = false
-		} else if !itr.heap.opt.Ascending && p.Time < itr.window.startTime {
+		} else if !opt.Ascending && p.Time < window.startTime {
 			inWindow = false
 		}
 
@@ -2042,7 +2188,7 @@ func (itr *integerMergeIterator) Next() *IntegerPoint {
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -2056,7 +2202,14 @@ type integerMergeHeap struct {
 func (h integerMergeHeap) Len() int      { return len(h.items) }
 func (h integerMergeHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
 func (h integerMergeHeap) Less(i, j int) bool {
-	x, y := h.items[i].itr.peek(), h.items[j].itr.peek()
+	x, err := h.items[i].itr.peek()
+	if err != nil {
+		return true
+	}
+	y, err := h.items[j].itr.peek()
+	if err != nil {
+		return false
+	}
 
 	if h.opt.Ascending {
 		if x.Name != y.Name {
@@ -2095,6 +2248,7 @@ func (h *integerMergeHeap) Pop() interface{} {
 
 type integerMergeHeapItem struct {
 	itr *bufIntegerIterator
+	err error
 }
 
 // integerSortedMergeIterator is an iterator that sorts and merges multiple iterators into one.
@@ -2102,6 +2256,8 @@ type integerSortedMergeIterator struct {
 	inputs []IntegerIterator
 	opt    IteratorOptions
 	heap   integerSortedMergeHeap
+	init   bool
+	point  IntegerPoint
 }
 
 // newIntegerSortedMergeIterator returns an instance of integerSortedMergeIterator.
@@ -2112,18 +2268,11 @@ func newIntegerSortedMergeIterator(inputs []IntegerIterator, opt IteratorOptions
 		opt:    opt,
 	}
 
-	// Initialize heap.
+	// Initialize heap items.
 	for _, input := range inputs {
-		// Read next point.
-		p := input.Next()
-		if p == nil {
-			continue
-		}
-
 		// Append to the heap.
-		itr.heap = append(itr.heap, &integerSortedMergeHeapItem{point: p, itr: input, ascending: opt.Ascending})
+		itr.heap = append(itr.heap, &integerSortedMergeHeapItem{itr: input, ascending: opt.Ascending})
 	}
-	heap.Init(&itr.heap)
 
 	return itr
 }
@@ -2146,27 +2295,49 @@ func (itr *integerSortedMergeIterator) Close() error {
 }
 
 // Next returns the next points from the iterator.
-func (itr *integerSortedMergeIterator) Next() *IntegerPoint { return itr.pop() }
+func (itr *integerSortedMergeIterator) Next() (*IntegerPoint, error) { return itr.pop() }
 
 // pop returns the next point from the heap.
 // Reads the next point from item's cursor and puts it back on the heap.
-func (itr *integerSortedMergeIterator) pop() *IntegerPoint {
+func (itr *integerSortedMergeIterator) pop() (*IntegerPoint, error) {
+	// Initialize the heap. See the MergeIterator to see why this has to be done lazily.
+	if !itr.init {
+		items := itr.heap
+		itr.heap = make([]*integerSortedMergeHeapItem, 0, len(items))
+		for _, item := range items {
+			var err error
+			if item.point, err = item.itr.Next(); err != nil {
+				return nil, err
+			} else if item.point == nil {
+				continue
+			}
+			itr.heap = append(itr.heap, item)
+		}
+		heap.Init(&itr.heap)
+		itr.init = true
+	}
+
 	if len(itr.heap) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Read the next item from the heap.
 	item := heap.Pop(&itr.heap).(*integerSortedMergeHeapItem)
+	if item.err != nil {
+		return nil, item.err
+	} else if item.point == nil {
+		return nil, nil
+	}
 
 	// Copy the point for return.
 	p := item.point.Clone()
 
 	// Read the next item from the cursor. Push back to heap if one exists.
-	if item.point = item.itr.Next(); item.point != nil {
+	if item.point, item.err = item.itr.Next(); item.point != nil {
 		heap.Push(&itr.heap, item)
 	}
 
-	return p
+	return p, nil
 }
 
 // integerSortedMergeHeap represents a heap of integerSortedMergeHeapItems.
@@ -2208,6 +2379,7 @@ func (h *integerSortedMergeHeap) Pop() interface{} {
 
 type integerSortedMergeHeapItem struct {
 	point     *IntegerPoint
+	err       error
 	itr       IntegerIterator
 	ascending bool
 }
@@ -2239,11 +2411,11 @@ func (itr *integerLimitIterator) Stats() IteratorStats { return itr.input.Stats(
 func (itr *integerLimitIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next point from the iterator.
-func (itr *integerLimitIterator) Next() *IntegerPoint {
+func (itr *integerLimitIterator) Next() (*IntegerPoint, error) {
 	for {
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Reset window and counter if a new window is encountered.
@@ -2265,12 +2437,12 @@ func (itr *integerLimitIterator) Next() *IntegerPoint {
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
 			// If there's no interval, no groups, and a single source then simply exit.
 			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil
+				return nil, nil
 			}
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -2280,7 +2452,7 @@ type integerFillIterator struct {
 	startTime int64
 	endTime   int64
 	auxFields []interface{}
-	done      bool
+	init      bool
 	opt       IteratorOptions
 
 	window struct {
@@ -2301,9 +2473,9 @@ func newIntegerFillIterator(input IntegerIterator, expr Expr, opt IteratorOption
 	var startTime, endTime int64
 	if opt.Ascending {
 		startTime, _ = opt.Window(opt.StartTime)
-		_, endTime = opt.Window(opt.EndTime)
+		endTime, _ = opt.Window(opt.EndTime)
 	} else {
-		_, startTime = opt.Window(opt.EndTime)
+		startTime, _ = opt.Window(opt.EndTime)
 		endTime, _ = opt.Window(opt.StartTime)
 	}
 
@@ -2312,36 +2484,40 @@ func newIntegerFillIterator(input IntegerIterator, expr Expr, opt IteratorOption
 		auxFields = make([]interface{}, len(opt.Aux))
 	}
 
-	itr := &integerFillIterator{
+	return &integerFillIterator{
 		input:     newBufIntegerIterator(input),
 		startTime: startTime,
 		endTime:   endTime,
 		auxFields: auxFields,
 		opt:       opt,
 	}
-
-	p := itr.input.peek()
-	if p != nil {
-		itr.window.name, itr.window.tags = p.Name, p.Tags
-		itr.window.time = itr.startTime
-	} else {
-		itr.window.time = itr.endTime
-	}
-	return itr
 }
 
 func (itr *integerFillIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *integerFillIterator) Close() error         { return itr.input.Close() }
 
-func (itr *integerFillIterator) Next() *IntegerPoint {
-	p := itr.input.Next()
+func (itr *integerFillIterator) Next() (*IntegerPoint, error) {
+	if !itr.init {
+		p, err := itr.input.peek()
+		if p == nil || err != nil {
+			return nil, err
+		}
+		itr.window.name, itr.window.tags = p.Name, p.Tags
+		itr.window.time = itr.startTime
+		itr.init = true
+	}
+
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if the next point is outside of our window or is nil.
 	for p == nil || p.Name != itr.window.name || p.Tags.ID() != itr.window.tags.ID() {
 		// If we are inside of an interval, unread the point and continue below to
 		// constructing a new point.
 		if itr.opt.Ascending {
-			if itr.window.time < itr.endTime {
+			if itr.window.time <= itr.endTime {
 				itr.input.unread(p)
 				p = nil
 				break
@@ -2357,7 +2533,7 @@ func (itr *integerFillIterator) Next() *IntegerPoint {
 		// We are *not* in a current interval. If there is no next point,
 		// we are at the end of all intervals.
 		if p == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Set the new interval.
@@ -2368,7 +2544,7 @@ func (itr *integerFillIterator) Next() *IntegerPoint {
 	}
 
 	// Check if the point is our next expected point.
-	if p == nil || p.Time > itr.window.time {
+	if p == nil || (itr.opt.Ascending && p.Time > itr.window.time) || (!itr.opt.Ascending && p.Time < itr.window.time) {
 		if p != nil {
 			itr.input.unread(p)
 		}
@@ -2405,7 +2581,7 @@ func (itr *integerFillIterator) Next() *IntegerPoint {
 	} else {
 		itr.window.time = p.Time - int64(itr.opt.Interval.Duration)
 	}
-	return p
+	return p, nil
 }
 
 // integerIntervalIterator represents a integer implementation of IntervalIterator.
@@ -2421,13 +2597,13 @@ func newIntegerIntervalIterator(input IntegerIterator, opt IteratorOptions) *int
 func (itr *integerIntervalIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *integerIntervalIterator) Close() error         { return itr.input.Close() }
 
-func (itr *integerIntervalIterator) Next() *IntegerPoint {
-	p := itr.input.Next()
-	if p == nil {
-		return p
+func (itr *integerIntervalIterator) Next() (*IntegerPoint, error) {
+	p, err := itr.input.Next()
+	if p == nil || err != nil {
+		return nil, err
 	}
 	p.Time, _ = itr.opt.Window(p.Time)
-	return p
+	return p, nil
 }
 
 // integerInterruptIterator represents a integer implementation of InterruptIterator.
@@ -2444,15 +2620,15 @@ func newIntegerInterruptIterator(input IntegerIterator, closing <-chan struct{})
 func (itr *integerInterruptIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *integerInterruptIterator) Close() error         { return itr.input.Close() }
 
-func (itr *integerInterruptIterator) Next() *IntegerPoint {
-	// Only check if the channel is closed every 256 points. This
-	// intentionally checks on both 0 and 256 so that if the iterator
+func (itr *integerInterruptIterator) Next() (*IntegerPoint, error) {
+	// Only check if the channel is closed every N points. This
+	// intentionally checks on both 0 and N so that if the iterator
 	// has been interrupted before the first point is emitted it will
 	// not emit any points.
-	if itr.count&0x100 == 0 {
+	if itr.count&0xFF == 0xFF {
 		select {
 		case <-itr.closing:
-			return nil
+			return nil, nil
 		default:
 			// Reset iterator count to zero and fall through to emit the next point.
 			itr.count = 0
@@ -2464,10 +2640,16 @@ func (itr *integerInterruptIterator) Next() *IntegerPoint {
 	return itr.input.Next()
 }
 
+// auxIntegerPoint represents a combination of a point and an error for the AuxIterator.
+type auxIntegerPoint struct {
+	point *IntegerPoint
+	err   error
+}
+
 // integerAuxIterator represents a integer implementation of AuxIterator.
 type integerAuxIterator struct {
 	input      *bufIntegerIterator
-	output     chan *IntegerPoint
+	output     chan auxIntegerPoint
 	fields     auxIteratorFields
 	background bool
 }
@@ -2475,7 +2657,7 @@ type integerAuxIterator struct {
 func newIntegerAuxIterator(input IntegerIterator, seriesKeys SeriesList, opt IteratorOptions) *integerAuxIterator {
 	return &integerAuxIterator{
 		input:  newBufIntegerIterator(input),
-		output: make(chan *IntegerPoint, 1),
+		output: make(chan auxIntegerPoint, 1),
 		fields: newAuxIteratorFields(seriesKeys, opt),
 	}
 }
@@ -2483,13 +2665,16 @@ func newIntegerAuxIterator(input IntegerIterator, seriesKeys SeriesList, opt Ite
 func (itr *integerAuxIterator) Background() {
 	itr.background = true
 	itr.Start()
-	go drainIterator(itr)
+	go DrainIterator(itr)
 }
 
-func (itr *integerAuxIterator) Start()                        { go itr.stream() }
-func (itr *integerAuxIterator) Stats() IteratorStats          { return itr.input.Stats() }
-func (itr *integerAuxIterator) Close() error                  { return itr.input.Close() }
-func (itr *integerAuxIterator) Next() *IntegerPoint           { return <-itr.output }
+func (itr *integerAuxIterator) Start()               { go itr.stream() }
+func (itr *integerAuxIterator) Stats() IteratorStats { return itr.input.Stats() }
+func (itr *integerAuxIterator) Close() error         { return itr.input.Close() }
+func (itr *integerAuxIterator) Next() (*IntegerPoint, error) {
+	p := <-itr.output
+	return p.point, p.err
+}
 func (itr *integerAuxIterator) Iterator(name string) Iterator { return itr.fields.iterator(name) }
 
 func (itr *integerAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
@@ -2521,13 +2706,17 @@ func (itr *integerAuxIterator) ExpandSources(sources Sources) (Sources, error) {
 func (itr *integerAuxIterator) stream() {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
+		p, err := itr.input.Next()
+		if err != nil {
+			itr.output <- auxIntegerPoint{err: err}
+			itr.fields.sendError(err)
+			break
+		} else if p == nil {
 			break
 		}
 
 		// Send point to output and to each field iterator.
-		itr.output <- p
+		itr.output <- auxIntegerPoint{point: p}
 		if ok := itr.fields.send(p); !ok && itr.background {
 			break
 		}
@@ -2539,7 +2728,12 @@ func (itr *integerAuxIterator) stream() {
 
 // integerChanIterator represents a new instance of integerChanIterator.
 type integerChanIterator struct {
-	buf  *IntegerPoint
+	buf struct {
+		i      int
+		filled bool
+		points [2]IntegerPoint
+	}
+	err  error
 	cond *sync.Cond
 	done bool
 }
@@ -2562,7 +2756,7 @@ func (itr *integerChanIterator) setBuf(name string, tags Tags, time int64, value
 
 	// Wait for either the iterator to be done (so we don't have to set the value)
 	// or for the buffer to have been read and ready for another write.
-	for !itr.done && itr.buf != nil {
+	for !itr.done && itr.buf.filled {
 		itr.cond.Wait()
 	}
 
@@ -2575,35 +2769,55 @@ func (itr *integerChanIterator) setBuf(name string, tags Tags, time int64, value
 
 	switch v := value.(type) {
 	case int64:
-		itr.buf = &IntegerPoint{Name: name, Tags: tags, Time: time, Value: v}
+		itr.buf.points[itr.buf.i] = IntegerPoint{Name: name, Tags: tags, Time: time, Value: v}
 
 	default:
-		itr.buf = &IntegerPoint{Name: name, Tags: tags, Time: time, Nil: true}
+		itr.buf.points[itr.buf.i] = IntegerPoint{Name: name, Tags: tags, Time: time, Nil: true}
 	}
+	itr.buf.filled = true
+
 	// Signal to all waiting goroutines that a new value is ready to read.
 	itr.cond.Signal()
 	return true
 }
 
-func (itr *integerChanIterator) Next() *IntegerPoint {
+func (itr *integerChanIterator) setErr(err error) {
 	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+	itr.err = err
+
+	// Signal to all waiting goroutines that a new value is ready to read.
+	itr.cond.Signal()
+}
+
+func (itr *integerChanIterator) Next() (*IntegerPoint, error) {
+	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+
+	// Check for an error and return one if there.
+	if itr.err != nil {
+		return nil, itr.err
+	}
 
 	// Wait until either a value is available in the buffer or
 	// the iterator is closed.
-	for !itr.done && itr.buf == nil {
+	for !itr.done && !itr.buf.filled {
 		itr.cond.Wait()
+	}
+
+	// Return nil once the channel is done and the buffer is empty.
+	if itr.done && !itr.buf.filled {
+		return nil, nil
 	}
 
 	// Always read from the buffer if it exists, even if the iterator
 	// is closed. This prevents the last value from being truncated by
 	// the parent iterator.
-	p := itr.buf
-	itr.buf = nil
+	p := &itr.buf.points[itr.buf.i]
+	itr.buf.i = (itr.buf.i + 1) % len(itr.buf.points)
+	itr.buf.filled = false
 	itr.cond.Signal()
-
-	// Do not defer the unlock so we don't create an unnecessary allocation.
-	itr.cond.L.Unlock()
-	return p
+	return p, nil
 }
 
 // integerReduceFloatIterator executes a reducer for every interval and buffers the result.
@@ -2621,19 +2835,20 @@ func (itr *integerReduceFloatIterator) Stats() IteratorStats { return itr.input.
 func (itr *integerReduceFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerReduceFloatIterator) Next() *FloatPoint {
+func (itr *integerReduceFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // integerReduceFloatPoint stores the reduced data for a name/tag combination.
@@ -2646,16 +2861,22 @@ type integerReduceFloatPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *integerReduceFloatIterator) reduce() []FloatPoint {
+func (itr *integerReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceFloatPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -2687,7 +2908,9 @@ func (itr *integerReduceFloatIterator) reduce() []FloatPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
@@ -2704,10 +2927,10 @@ func (itr *integerReduceFloatIterator) reduce() []FloatPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// integerStreamFloatIterator
+// integerStreamFloatIterator streams inputs into the iterator and emits points gradually.
 type integerStreamFloatIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, FloatPointEmitter)
@@ -2716,6 +2939,7 @@ type integerStreamFloatIterator struct {
 	points []FloatPoint
 }
 
+// newIntegerStreamFloatIterator returns a new instance of integerStreamFloatIterator.
 func newIntegerStreamFloatIterator(input IntegerIterator, createFn func() (IntegerPointAggregator, FloatPointEmitter), opt IteratorOptions) *integerStreamFloatIterator {
 	return &integerStreamFloatIterator{
 		input:  newBufIntegerIterator(input),
@@ -2732,29 +2956,30 @@ func (itr *integerStreamFloatIterator) Stats() IteratorStats { return itr.input.
 func (itr *integerStreamFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *integerStreamFloatIterator) Next() *FloatPoint {
+func (itr *integerStreamFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *integerStreamFloatIterator) reduce() []FloatPoint {
+func (itr *integerStreamFloatIterator) reduce() ([]FloatPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -2789,7 +3014,7 @@ func (itr *integerStreamFloatIterator) reduce() []FloatPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -2813,13 +3038,18 @@ func (itr *integerFloatExprIterator) Close() error {
 	return nil
 }
 
-func (itr *integerFloatExprIterator) Next() *FloatPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *integerFloatExprIterator) Next() (*FloatPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // integerFloatExprFunc creates or modifies a point by combining two
@@ -2843,19 +3073,20 @@ func (itr *integerReduceIntegerIterator) Stats() IteratorStats { return itr.inpu
 func (itr *integerReduceIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerReduceIntegerIterator) Next() *IntegerPoint {
+func (itr *integerReduceIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // integerReduceIntegerPoint stores the reduced data for a name/tag combination.
@@ -2868,16 +3099,22 @@ type integerReduceIntegerPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *integerReduceIntegerIterator) reduce() []IntegerPoint {
+func (itr *integerReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceIntegerPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -2909,7 +3146,9 @@ func (itr *integerReduceIntegerIterator) reduce() []IntegerPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
@@ -2926,10 +3165,10 @@ func (itr *integerReduceIntegerIterator) reduce() []IntegerPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// integerStreamIntegerIterator
+// integerStreamIntegerIterator streams inputs into the iterator and emits points gradually.
 type integerStreamIntegerIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, IntegerPointEmitter)
@@ -2938,6 +3177,7 @@ type integerStreamIntegerIterator struct {
 	points []IntegerPoint
 }
 
+// newIntegerStreamIntegerIterator returns a new instance of integerStreamIntegerIterator.
 func newIntegerStreamIntegerIterator(input IntegerIterator, createFn func() (IntegerPointAggregator, IntegerPointEmitter), opt IteratorOptions) *integerStreamIntegerIterator {
 	return &integerStreamIntegerIterator{
 		input:  newBufIntegerIterator(input),
@@ -2954,29 +3194,30 @@ func (itr *integerStreamIntegerIterator) Stats() IteratorStats { return itr.inpu
 func (itr *integerStreamIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *integerStreamIntegerIterator) Next() *IntegerPoint {
+func (itr *integerStreamIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *integerStreamIntegerIterator) reduce() []IntegerPoint {
+func (itr *integerStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -3011,7 +3252,7 @@ func (itr *integerStreamIntegerIterator) reduce() []IntegerPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -3035,13 +3276,18 @@ func (itr *integerExprIterator) Close() error {
 	return nil
 }
 
-func (itr *integerExprIterator) Next() *IntegerPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *integerExprIterator) Next() (*IntegerPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // integerExprFunc creates or modifies a point by combining two
@@ -3065,19 +3311,20 @@ func (itr *integerReduceStringIterator) Stats() IteratorStats { return itr.input
 func (itr *integerReduceStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerReduceStringIterator) Next() *StringPoint {
+func (itr *integerReduceStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // integerReduceStringPoint stores the reduced data for a name/tag combination.
@@ -3090,16 +3337,22 @@ type integerReduceStringPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *integerReduceStringIterator) reduce() []StringPoint {
+func (itr *integerReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceStringPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -3131,7 +3384,9 @@ func (itr *integerReduceStringIterator) reduce() []StringPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
@@ -3148,10 +3403,10 @@ func (itr *integerReduceStringIterator) reduce() []StringPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// integerStreamStringIterator
+// integerStreamStringIterator streams inputs into the iterator and emits points gradually.
 type integerStreamStringIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, StringPointEmitter)
@@ -3160,6 +3415,7 @@ type integerStreamStringIterator struct {
 	points []StringPoint
 }
 
+// newIntegerStreamStringIterator returns a new instance of integerStreamStringIterator.
 func newIntegerStreamStringIterator(input IntegerIterator, createFn func() (IntegerPointAggregator, StringPointEmitter), opt IteratorOptions) *integerStreamStringIterator {
 	return &integerStreamStringIterator{
 		input:  newBufIntegerIterator(input),
@@ -3176,29 +3432,30 @@ func (itr *integerStreamStringIterator) Stats() IteratorStats { return itr.input
 func (itr *integerStreamStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *integerStreamStringIterator) Next() *StringPoint {
+func (itr *integerStreamStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *integerStreamStringIterator) reduce() []StringPoint {
+func (itr *integerStreamStringIterator) reduce() ([]StringPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -3233,7 +3490,7 @@ func (itr *integerStreamStringIterator) reduce() []StringPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -3257,13 +3514,18 @@ func (itr *integerStringExprIterator) Close() error {
 	return nil
 }
 
-func (itr *integerStringExprIterator) Next() *StringPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *integerStringExprIterator) Next() (*StringPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // integerStringExprFunc creates or modifies a point by combining two
@@ -3287,19 +3549,20 @@ func (itr *integerReduceBooleanIterator) Stats() IteratorStats { return itr.inpu
 func (itr *integerReduceBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerReduceBooleanIterator) Next() *BooleanPoint {
+func (itr *integerReduceBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // integerReduceBooleanPoint stores the reduced data for a name/tag combination.
@@ -3312,16 +3575,22 @@ type integerReduceBooleanPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *integerReduceBooleanIterator) reduce() []BooleanPoint {
+func (itr *integerReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceBooleanPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -3353,7 +3622,9 @@ func (itr *integerReduceBooleanIterator) reduce() []BooleanPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
@@ -3370,10 +3641,10 @@ func (itr *integerReduceBooleanIterator) reduce() []BooleanPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// integerStreamBooleanIterator
+// integerStreamBooleanIterator streams inputs into the iterator and emits points gradually.
 type integerStreamBooleanIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, BooleanPointEmitter)
@@ -3382,6 +3653,7 @@ type integerStreamBooleanIterator struct {
 	points []BooleanPoint
 }
 
+// newIntegerStreamBooleanIterator returns a new instance of integerStreamBooleanIterator.
 func newIntegerStreamBooleanIterator(input IntegerIterator, createFn func() (IntegerPointAggregator, BooleanPointEmitter), opt IteratorOptions) *integerStreamBooleanIterator {
 	return &integerStreamBooleanIterator{
 		input:  newBufIntegerIterator(input),
@@ -3398,29 +3670,30 @@ func (itr *integerStreamBooleanIterator) Stats() IteratorStats { return itr.inpu
 func (itr *integerStreamBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *integerStreamBooleanIterator) Next() *BooleanPoint {
+func (itr *integerStreamBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *integerStreamBooleanIterator) reduce() []BooleanPoint {
+func (itr *integerStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -3455,7 +3728,7 @@ func (itr *integerStreamBooleanIterator) reduce() []BooleanPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -3479,13 +3752,18 @@ func (itr *integerBooleanExprIterator) Close() error {
 	return nil
 }
 
-func (itr *integerBooleanExprIterator) Next() *BooleanPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *integerBooleanExprIterator) Next() (*BooleanPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // integerBooleanExprFunc creates or modifies a point by combining two
@@ -3508,12 +3786,14 @@ func (itr *integerTransformIterator) Stats() IteratorStats { return itr.input.St
 func (itr *integerTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerTransformIterator) Next() *IntegerPoint {
-	p := itr.input.Next()
-	if p != nil {
+func (itr *integerTransformIterator) Next() (*IntegerPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
 		p = itr.fn(p)
 	}
-	return p
+	return p, nil
 }
 
 // integerTransformFunc creates or modifies a point.
@@ -3535,12 +3815,14 @@ func (itr *integerBoolTransformIterator) Stats() IteratorStats { return itr.inpu
 func (itr *integerBoolTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerBoolTransformIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
-	if p != nil {
-		return itr.fn(p)
+func (itr *integerBoolTransformIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
+		return itr.fn(p), nil
 	}
-	return nil
+	return nil, nil
 }
 
 // integerBoolTransformFunc creates or modifies a point.
@@ -3572,19 +3854,18 @@ func (itr *integerDedupeIterator) Stats() IteratorStats { return itr.input.Stats
 func (itr *integerDedupeIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next unique point from the input iterator.
-func (itr *integerDedupeIterator) Next() *IntegerPoint {
+func (itr *integerDedupeIterator) Next() (*IntegerPoint, error) {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Serialize to bytes to store in lookup.
 		buf, err := proto.Marshal(encodeIntegerPoint(p))
 		if err != nil {
-			log.Println("error marshaling dedupe point:", err)
-			continue
+			return nil, err
 		}
 
 		// If the point has already been output then move to the next point.
@@ -3594,26 +3875,24 @@ func (itr *integerDedupeIterator) Next() *IntegerPoint {
 
 		// Otherwise mark it as emitted and return point.
 		itr.m[string(buf)] = struct{}{}
-		return p
+		return p, nil
 	}
 }
 
 // integerReaderIterator represents an iterator that streams from a reader.
 type integerReaderIterator struct {
-	r     io.Reader
-	dec   *IntegerPointDecoder
-	first *IntegerPoint
+	r   io.Reader
+	dec *IntegerPointDecoder
 }
 
 // newIntegerReaderIterator returns a new instance of integerReaderIterator.
-func newIntegerReaderIterator(r io.Reader, first *IntegerPoint, stats IteratorStats) *integerReaderIterator {
+func newIntegerReaderIterator(r io.Reader, stats IteratorStats) *integerReaderIterator {
 	dec := NewIntegerPointDecoder(r)
 	dec.stats = stats
 
 	return &integerReaderIterator{
-		r:     r,
-		dec:   dec,
-		first: first,
+		r:   r,
+		dec: dec,
 	}
 }
 
@@ -3629,31 +3908,23 @@ func (itr *integerReaderIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *integerReaderIterator) Next() *IntegerPoint {
-	// Send first point if it hasn't been sent yet.
-	if itr.first != nil {
-		p := itr.first
-		itr.first = nil
-		return p
-	}
-
+func (itr *integerReaderIterator) Next() (*IntegerPoint, error) {
 	// OPTIMIZE(benbjohnson): Reuse point on iterator.
 
 	// Unmarshal next point.
 	p := &IntegerPoint{}
 	if err := itr.dec.DecodeIntegerPoint(p); err == io.EOF {
-		return nil
+		return nil, nil
 	} else if err != nil {
-		log.Printf("error reading iterator point: %s", err)
-		return nil
+		return nil, err
 	}
-	return p
+	return p, nil
 }
 
 // StringIterator represents a stream of string points.
 type StringIterator interface {
 	Iterator
-	Next() *StringPoint
+	Next() (*StringPoint, error)
 }
 
 // newStringIterators converts a slice of Iterator to a slice of StringIterator.
@@ -3691,43 +3962,46 @@ func (itr *bufStringIterator) Stats() IteratorStats { return itr.itr.Stats() }
 func (itr *bufStringIterator) Close() error { return itr.itr.Close() }
 
 // peek returns the next point without removing it from the iterator.
-func (itr *bufStringIterator) peek() *StringPoint {
-	p := itr.Next()
+func (itr *bufStringIterator) peek() (*StringPoint, error) {
+	p, err := itr.Next()
+	if err != nil {
+		return nil, err
+	}
 	itr.unread(p)
-	return p
+	return p, nil
 }
 
 // peekTime returns the time of the next point.
 // Returns zero time if no more points available.
-func (itr *bufStringIterator) peekTime() int64 {
-	p := itr.peek()
-	if p == nil {
-		return ZeroTime
+func (itr *bufStringIterator) peekTime() (int64, error) {
+	p, err := itr.peek()
+	if p == nil || err != nil {
+		return ZeroTime, err
 	}
-	return p.Time
+	return p.Time, nil
 }
 
 // Next returns the current buffer, if exists, or calls the underlying iterator.
-func (itr *bufStringIterator) Next() *StringPoint {
-	if itr.buf != nil {
-		buf := itr.buf
+func (itr *bufStringIterator) Next() (*StringPoint, error) {
+	buf := itr.buf
+	if buf != nil {
 		itr.buf = nil
-		return buf
+		return buf, nil
 	}
 	return itr.itr.Next()
 }
 
 // NextInWindow returns the next value if it is between [startTime, endTime).
 // If the next value is outside the range then it is moved to the buffer.
-func (itr *bufStringIterator) NextInWindow(startTime, endTime int64) *StringPoint {
-	v := itr.Next()
-	if v == nil {
-		return nil
-	} else if v.Time < startTime || v.Time >= endTime {
+func (itr *bufStringIterator) NextInWindow(startTime, endTime int64) (*StringPoint, error) {
+	v, err := itr.Next()
+	if v == nil || err != nil {
+		return nil, err
+	} else if t := v.Time; t >= endTime || t < startTime {
 		itr.unread(v)
-		return nil
+		return nil, nil
 	}
-	return v
+	return v, nil
 }
 
 // unread sets v to the buffer. It is read on the next call to Next().
@@ -3789,7 +4063,7 @@ func (itr *stringMergeIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *stringMergeIterator) Next() *StringPoint {
+func (itr *stringMergeIterator) Next() (*StringPoint, error) {
 	// Initialize the heap. This needs to be done lazily on the first call to this iterator
 	// so that iterator initialization done through the Select() call returns quickly.
 	// Queries can only be interrupted after the Select() call completes so any operations
@@ -3799,7 +4073,9 @@ func (itr *stringMergeIterator) Next() *StringPoint {
 		items := itr.heap.items
 		itr.heap.items = make([]*stringMergeHeapItem, 0, len(items))
 		for _, item := range items {
-			if item.itr.peek() == nil {
+			if p, err := item.itr.peek(); err != nil {
+				return nil, err
+			} else if p == nil {
 				continue
 			}
 			itr.heap.items = append(itr.heap.items, item)
@@ -3812,19 +4088,25 @@ func (itr *stringMergeIterator) Next() *StringPoint {
 		// Retrieve the next iterator if we don't have one.
 		if itr.curr == nil {
 			if len(itr.heap.items) == 0 {
-				return nil
+				return nil, nil
 			}
 			itr.curr = heap.Pop(itr.heap).(*stringMergeHeapItem)
 
 			// Read point and set current window.
-			p := itr.curr.itr.Next()
+			p, err := itr.curr.itr.Next()
+			if err != nil {
+				return nil, err
+			}
 			itr.window.name, itr.window.tags = p.Name, p.Tags.ID()
 			itr.window.startTime, itr.window.endTime = itr.heap.opt.Window(p.Time)
-			return p
+			return p, nil
 		}
 
 		// Read the next point from the current iterator.
-		p := itr.curr.itr.Next()
+		p, err := itr.curr.itr.Next()
+		if err != nil {
+			return nil, err
+		}
 
 		// If there are no more points then remove iterator from heap and find next.
 		if p == nil {
@@ -3834,13 +4116,13 @@ func (itr *stringMergeIterator) Next() *StringPoint {
 
 		// Check if the point is inside of our current window.
 		inWindow := true
-		if itr.window.name != p.Name {
+		if window := itr.window; window.name != p.Name {
 			inWindow = false
-		} else if itr.window.tags != p.Tags.ID() {
+		} else if window.tags != p.Tags.ID() {
 			inWindow = false
-		} else if itr.heap.opt.Ascending && p.Time >= itr.window.endTime {
+		} else if opt := itr.heap.opt; opt.Ascending && p.Time >= window.endTime {
 			inWindow = false
-		} else if !itr.heap.opt.Ascending && p.Time < itr.window.startTime {
+		} else if !opt.Ascending && p.Time < window.startTime {
 			inWindow = false
 		}
 
@@ -3852,7 +4134,7 @@ func (itr *stringMergeIterator) Next() *StringPoint {
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -3866,7 +4148,14 @@ type stringMergeHeap struct {
 func (h stringMergeHeap) Len() int      { return len(h.items) }
 func (h stringMergeHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
 func (h stringMergeHeap) Less(i, j int) bool {
-	x, y := h.items[i].itr.peek(), h.items[j].itr.peek()
+	x, err := h.items[i].itr.peek()
+	if err != nil {
+		return true
+	}
+	y, err := h.items[j].itr.peek()
+	if err != nil {
+		return false
+	}
 
 	if h.opt.Ascending {
 		if x.Name != y.Name {
@@ -3905,6 +4194,7 @@ func (h *stringMergeHeap) Pop() interface{} {
 
 type stringMergeHeapItem struct {
 	itr *bufStringIterator
+	err error
 }
 
 // stringSortedMergeIterator is an iterator that sorts and merges multiple iterators into one.
@@ -3912,6 +4202,8 @@ type stringSortedMergeIterator struct {
 	inputs []StringIterator
 	opt    IteratorOptions
 	heap   stringSortedMergeHeap
+	init   bool
+	point  StringPoint
 }
 
 // newStringSortedMergeIterator returns an instance of stringSortedMergeIterator.
@@ -3922,18 +4214,11 @@ func newStringSortedMergeIterator(inputs []StringIterator, opt IteratorOptions) 
 		opt:    opt,
 	}
 
-	// Initialize heap.
+	// Initialize heap items.
 	for _, input := range inputs {
-		// Read next point.
-		p := input.Next()
-		if p == nil {
-			continue
-		}
-
 		// Append to the heap.
-		itr.heap = append(itr.heap, &stringSortedMergeHeapItem{point: p, itr: input, ascending: opt.Ascending})
+		itr.heap = append(itr.heap, &stringSortedMergeHeapItem{itr: input, ascending: opt.Ascending})
 	}
-	heap.Init(&itr.heap)
 
 	return itr
 }
@@ -3956,27 +4241,49 @@ func (itr *stringSortedMergeIterator) Close() error {
 }
 
 // Next returns the next points from the iterator.
-func (itr *stringSortedMergeIterator) Next() *StringPoint { return itr.pop() }
+func (itr *stringSortedMergeIterator) Next() (*StringPoint, error) { return itr.pop() }
 
 // pop returns the next point from the heap.
 // Reads the next point from item's cursor and puts it back on the heap.
-func (itr *stringSortedMergeIterator) pop() *StringPoint {
+func (itr *stringSortedMergeIterator) pop() (*StringPoint, error) {
+	// Initialize the heap. See the MergeIterator to see why this has to be done lazily.
+	if !itr.init {
+		items := itr.heap
+		itr.heap = make([]*stringSortedMergeHeapItem, 0, len(items))
+		for _, item := range items {
+			var err error
+			if item.point, err = item.itr.Next(); err != nil {
+				return nil, err
+			} else if item.point == nil {
+				continue
+			}
+			itr.heap = append(itr.heap, item)
+		}
+		heap.Init(&itr.heap)
+		itr.init = true
+	}
+
 	if len(itr.heap) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Read the next item from the heap.
 	item := heap.Pop(&itr.heap).(*stringSortedMergeHeapItem)
+	if item.err != nil {
+		return nil, item.err
+	} else if item.point == nil {
+		return nil, nil
+	}
 
 	// Copy the point for return.
 	p := item.point.Clone()
 
 	// Read the next item from the cursor. Push back to heap if one exists.
-	if item.point = item.itr.Next(); item.point != nil {
+	if item.point, item.err = item.itr.Next(); item.point != nil {
 		heap.Push(&itr.heap, item)
 	}
 
-	return p
+	return p, nil
 }
 
 // stringSortedMergeHeap represents a heap of stringSortedMergeHeapItems.
@@ -4018,6 +4325,7 @@ func (h *stringSortedMergeHeap) Pop() interface{} {
 
 type stringSortedMergeHeapItem struct {
 	point     *StringPoint
+	err       error
 	itr       StringIterator
 	ascending bool
 }
@@ -4049,11 +4357,11 @@ func (itr *stringLimitIterator) Stats() IteratorStats { return itr.input.Stats()
 func (itr *stringLimitIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next point from the iterator.
-func (itr *stringLimitIterator) Next() *StringPoint {
+func (itr *stringLimitIterator) Next() (*StringPoint, error) {
 	for {
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Reset window and counter if a new window is encountered.
@@ -4075,12 +4383,12 @@ func (itr *stringLimitIterator) Next() *StringPoint {
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
 			// If there's no interval, no groups, and a single source then simply exit.
 			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil
+				return nil, nil
 			}
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -4090,7 +4398,7 @@ type stringFillIterator struct {
 	startTime int64
 	endTime   int64
 	auxFields []interface{}
-	done      bool
+	init      bool
 	opt       IteratorOptions
 
 	window struct {
@@ -4111,9 +4419,9 @@ func newStringFillIterator(input StringIterator, expr Expr, opt IteratorOptions)
 	var startTime, endTime int64
 	if opt.Ascending {
 		startTime, _ = opt.Window(opt.StartTime)
-		_, endTime = opt.Window(opt.EndTime)
+		endTime, _ = opt.Window(opt.EndTime)
 	} else {
-		_, startTime = opt.Window(opt.EndTime)
+		startTime, _ = opt.Window(opt.EndTime)
 		endTime, _ = opt.Window(opt.StartTime)
 	}
 
@@ -4122,36 +4430,40 @@ func newStringFillIterator(input StringIterator, expr Expr, opt IteratorOptions)
 		auxFields = make([]interface{}, len(opt.Aux))
 	}
 
-	itr := &stringFillIterator{
+	return &stringFillIterator{
 		input:     newBufStringIterator(input),
 		startTime: startTime,
 		endTime:   endTime,
 		auxFields: auxFields,
 		opt:       opt,
 	}
-
-	p := itr.input.peek()
-	if p != nil {
-		itr.window.name, itr.window.tags = p.Name, p.Tags
-		itr.window.time = itr.startTime
-	} else {
-		itr.window.time = itr.endTime
-	}
-	return itr
 }
 
 func (itr *stringFillIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *stringFillIterator) Close() error         { return itr.input.Close() }
 
-func (itr *stringFillIterator) Next() *StringPoint {
-	p := itr.input.Next()
+func (itr *stringFillIterator) Next() (*StringPoint, error) {
+	if !itr.init {
+		p, err := itr.input.peek()
+		if p == nil || err != nil {
+			return nil, err
+		}
+		itr.window.name, itr.window.tags = p.Name, p.Tags
+		itr.window.time = itr.startTime
+		itr.init = true
+	}
+
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if the next point is outside of our window or is nil.
 	for p == nil || p.Name != itr.window.name || p.Tags.ID() != itr.window.tags.ID() {
 		// If we are inside of an interval, unread the point and continue below to
 		// constructing a new point.
 		if itr.opt.Ascending {
-			if itr.window.time < itr.endTime {
+			if itr.window.time <= itr.endTime {
 				itr.input.unread(p)
 				p = nil
 				break
@@ -4167,7 +4479,7 @@ func (itr *stringFillIterator) Next() *StringPoint {
 		// We are *not* in a current interval. If there is no next point,
 		// we are at the end of all intervals.
 		if p == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Set the new interval.
@@ -4178,7 +4490,7 @@ func (itr *stringFillIterator) Next() *StringPoint {
 	}
 
 	// Check if the point is our next expected point.
-	if p == nil || p.Time > itr.window.time {
+	if p == nil || (itr.opt.Ascending && p.Time > itr.window.time) || (!itr.opt.Ascending && p.Time < itr.window.time) {
 		if p != nil {
 			itr.input.unread(p)
 		}
@@ -4215,7 +4527,7 @@ func (itr *stringFillIterator) Next() *StringPoint {
 	} else {
 		itr.window.time = p.Time - int64(itr.opt.Interval.Duration)
 	}
-	return p
+	return p, nil
 }
 
 // stringIntervalIterator represents a string implementation of IntervalIterator.
@@ -4231,13 +4543,13 @@ func newStringIntervalIterator(input StringIterator, opt IteratorOptions) *strin
 func (itr *stringIntervalIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *stringIntervalIterator) Close() error         { return itr.input.Close() }
 
-func (itr *stringIntervalIterator) Next() *StringPoint {
-	p := itr.input.Next()
-	if p == nil {
-		return p
+func (itr *stringIntervalIterator) Next() (*StringPoint, error) {
+	p, err := itr.input.Next()
+	if p == nil || err != nil {
+		return nil, err
 	}
 	p.Time, _ = itr.opt.Window(p.Time)
-	return p
+	return p, nil
 }
 
 // stringInterruptIterator represents a string implementation of InterruptIterator.
@@ -4254,15 +4566,15 @@ func newStringInterruptIterator(input StringIterator, closing <-chan struct{}) *
 func (itr *stringInterruptIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *stringInterruptIterator) Close() error         { return itr.input.Close() }
 
-func (itr *stringInterruptIterator) Next() *StringPoint {
-	// Only check if the channel is closed every 256 points. This
-	// intentionally checks on both 0 and 256 so that if the iterator
+func (itr *stringInterruptIterator) Next() (*StringPoint, error) {
+	// Only check if the channel is closed every N points. This
+	// intentionally checks on both 0 and N so that if the iterator
 	// has been interrupted before the first point is emitted it will
 	// not emit any points.
-	if itr.count&0x100 == 0 {
+	if itr.count&0xFF == 0xFF {
 		select {
 		case <-itr.closing:
-			return nil
+			return nil, nil
 		default:
 			// Reset iterator count to zero and fall through to emit the next point.
 			itr.count = 0
@@ -4274,10 +4586,16 @@ func (itr *stringInterruptIterator) Next() *StringPoint {
 	return itr.input.Next()
 }
 
+// auxStringPoint represents a combination of a point and an error for the AuxIterator.
+type auxStringPoint struct {
+	point *StringPoint
+	err   error
+}
+
 // stringAuxIterator represents a string implementation of AuxIterator.
 type stringAuxIterator struct {
 	input      *bufStringIterator
-	output     chan *StringPoint
+	output     chan auxStringPoint
 	fields     auxIteratorFields
 	background bool
 }
@@ -4285,7 +4603,7 @@ type stringAuxIterator struct {
 func newStringAuxIterator(input StringIterator, seriesKeys SeriesList, opt IteratorOptions) *stringAuxIterator {
 	return &stringAuxIterator{
 		input:  newBufStringIterator(input),
-		output: make(chan *StringPoint, 1),
+		output: make(chan auxStringPoint, 1),
 		fields: newAuxIteratorFields(seriesKeys, opt),
 	}
 }
@@ -4293,13 +4611,16 @@ func newStringAuxIterator(input StringIterator, seriesKeys SeriesList, opt Itera
 func (itr *stringAuxIterator) Background() {
 	itr.background = true
 	itr.Start()
-	go drainIterator(itr)
+	go DrainIterator(itr)
 }
 
-func (itr *stringAuxIterator) Start()                        { go itr.stream() }
-func (itr *stringAuxIterator) Stats() IteratorStats          { return itr.input.Stats() }
-func (itr *stringAuxIterator) Close() error                  { return itr.input.Close() }
-func (itr *stringAuxIterator) Next() *StringPoint            { return <-itr.output }
+func (itr *stringAuxIterator) Start()               { go itr.stream() }
+func (itr *stringAuxIterator) Stats() IteratorStats { return itr.input.Stats() }
+func (itr *stringAuxIterator) Close() error         { return itr.input.Close() }
+func (itr *stringAuxIterator) Next() (*StringPoint, error) {
+	p := <-itr.output
+	return p.point, p.err
+}
 func (itr *stringAuxIterator) Iterator(name string) Iterator { return itr.fields.iterator(name) }
 
 func (itr *stringAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
@@ -4331,13 +4652,17 @@ func (itr *stringAuxIterator) ExpandSources(sources Sources) (Sources, error) {
 func (itr *stringAuxIterator) stream() {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
+		p, err := itr.input.Next()
+		if err != nil {
+			itr.output <- auxStringPoint{err: err}
+			itr.fields.sendError(err)
+			break
+		} else if p == nil {
 			break
 		}
 
 		// Send point to output and to each field iterator.
-		itr.output <- p
+		itr.output <- auxStringPoint{point: p}
 		if ok := itr.fields.send(p); !ok && itr.background {
 			break
 		}
@@ -4349,7 +4674,12 @@ func (itr *stringAuxIterator) stream() {
 
 // stringChanIterator represents a new instance of stringChanIterator.
 type stringChanIterator struct {
-	buf  *StringPoint
+	buf struct {
+		i      int
+		filled bool
+		points [2]StringPoint
+	}
+	err  error
 	cond *sync.Cond
 	done bool
 }
@@ -4372,7 +4702,7 @@ func (itr *stringChanIterator) setBuf(name string, tags Tags, time int64, value 
 
 	// Wait for either the iterator to be done (so we don't have to set the value)
 	// or for the buffer to have been read and ready for another write.
-	for !itr.done && itr.buf != nil {
+	for !itr.done && itr.buf.filled {
 		itr.cond.Wait()
 	}
 
@@ -4385,35 +4715,55 @@ func (itr *stringChanIterator) setBuf(name string, tags Tags, time int64, value 
 
 	switch v := value.(type) {
 	case string:
-		itr.buf = &StringPoint{Name: name, Tags: tags, Time: time, Value: v}
+		itr.buf.points[itr.buf.i] = StringPoint{Name: name, Tags: tags, Time: time, Value: v}
 
 	default:
-		itr.buf = &StringPoint{Name: name, Tags: tags, Time: time, Nil: true}
+		itr.buf.points[itr.buf.i] = StringPoint{Name: name, Tags: tags, Time: time, Nil: true}
 	}
+	itr.buf.filled = true
+
 	// Signal to all waiting goroutines that a new value is ready to read.
 	itr.cond.Signal()
 	return true
 }
 
-func (itr *stringChanIterator) Next() *StringPoint {
+func (itr *stringChanIterator) setErr(err error) {
 	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+	itr.err = err
+
+	// Signal to all waiting goroutines that a new value is ready to read.
+	itr.cond.Signal()
+}
+
+func (itr *stringChanIterator) Next() (*StringPoint, error) {
+	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+
+	// Check for an error and return one if there.
+	if itr.err != nil {
+		return nil, itr.err
+	}
 
 	// Wait until either a value is available in the buffer or
 	// the iterator is closed.
-	for !itr.done && itr.buf == nil {
+	for !itr.done && !itr.buf.filled {
 		itr.cond.Wait()
+	}
+
+	// Return nil once the channel is done and the buffer is empty.
+	if itr.done && !itr.buf.filled {
+		return nil, nil
 	}
 
 	// Always read from the buffer if it exists, even if the iterator
 	// is closed. This prevents the last value from being truncated by
 	// the parent iterator.
-	p := itr.buf
-	itr.buf = nil
+	p := &itr.buf.points[itr.buf.i]
+	itr.buf.i = (itr.buf.i + 1) % len(itr.buf.points)
+	itr.buf.filled = false
 	itr.cond.Signal()
-
-	// Do not defer the unlock so we don't create an unnecessary allocation.
-	itr.cond.L.Unlock()
-	return p
+	return p, nil
 }
 
 // stringReduceFloatIterator executes a reducer for every interval and buffers the result.
@@ -4431,19 +4781,20 @@ func (itr *stringReduceFloatIterator) Stats() IteratorStats { return itr.input.S
 func (itr *stringReduceFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *stringReduceFloatIterator) Next() *FloatPoint {
+func (itr *stringReduceFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // stringReduceFloatPoint stores the reduced data for a name/tag combination.
@@ -4456,16 +4807,22 @@ type stringReduceFloatPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *stringReduceFloatIterator) reduce() []FloatPoint {
+func (itr *stringReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceFloatPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -4497,7 +4854,9 @@ func (itr *stringReduceFloatIterator) reduce() []FloatPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
@@ -4514,10 +4873,10 @@ func (itr *stringReduceFloatIterator) reduce() []FloatPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// stringStreamFloatIterator
+// stringStreamFloatIterator streams inputs into the iterator and emits points gradually.
 type stringStreamFloatIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, FloatPointEmitter)
@@ -4526,6 +4885,7 @@ type stringStreamFloatIterator struct {
 	points []FloatPoint
 }
 
+// newStringStreamFloatIterator returns a new instance of stringStreamFloatIterator.
 func newStringStreamFloatIterator(input StringIterator, createFn func() (StringPointAggregator, FloatPointEmitter), opt IteratorOptions) *stringStreamFloatIterator {
 	return &stringStreamFloatIterator{
 		input:  newBufStringIterator(input),
@@ -4542,29 +4902,30 @@ func (itr *stringStreamFloatIterator) Stats() IteratorStats { return itr.input.S
 func (itr *stringStreamFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *stringStreamFloatIterator) Next() *FloatPoint {
+func (itr *stringStreamFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *stringStreamFloatIterator) reduce() []FloatPoint {
+func (itr *stringStreamFloatIterator) reduce() ([]FloatPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -4599,7 +4960,7 @@ func (itr *stringStreamFloatIterator) reduce() []FloatPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -4623,13 +4984,18 @@ func (itr *stringFloatExprIterator) Close() error {
 	return nil
 }
 
-func (itr *stringFloatExprIterator) Next() *FloatPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *stringFloatExprIterator) Next() (*FloatPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // stringFloatExprFunc creates or modifies a point by combining two
@@ -4653,19 +5019,20 @@ func (itr *stringReduceIntegerIterator) Stats() IteratorStats { return itr.input
 func (itr *stringReduceIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *stringReduceIntegerIterator) Next() *IntegerPoint {
+func (itr *stringReduceIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // stringReduceIntegerPoint stores the reduced data for a name/tag combination.
@@ -4678,16 +5045,22 @@ type stringReduceIntegerPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *stringReduceIntegerIterator) reduce() []IntegerPoint {
+func (itr *stringReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceIntegerPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -4719,7 +5092,9 @@ func (itr *stringReduceIntegerIterator) reduce() []IntegerPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
@@ -4736,10 +5111,10 @@ func (itr *stringReduceIntegerIterator) reduce() []IntegerPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// stringStreamIntegerIterator
+// stringStreamIntegerIterator streams inputs into the iterator and emits points gradually.
 type stringStreamIntegerIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, IntegerPointEmitter)
@@ -4748,6 +5123,7 @@ type stringStreamIntegerIterator struct {
 	points []IntegerPoint
 }
 
+// newStringStreamIntegerIterator returns a new instance of stringStreamIntegerIterator.
 func newStringStreamIntegerIterator(input StringIterator, createFn func() (StringPointAggregator, IntegerPointEmitter), opt IteratorOptions) *stringStreamIntegerIterator {
 	return &stringStreamIntegerIterator{
 		input:  newBufStringIterator(input),
@@ -4764,29 +5140,30 @@ func (itr *stringStreamIntegerIterator) Stats() IteratorStats { return itr.input
 func (itr *stringStreamIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *stringStreamIntegerIterator) Next() *IntegerPoint {
+func (itr *stringStreamIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *stringStreamIntegerIterator) reduce() []IntegerPoint {
+func (itr *stringStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -4821,7 +5198,7 @@ func (itr *stringStreamIntegerIterator) reduce() []IntegerPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -4845,13 +5222,18 @@ func (itr *stringIntegerExprIterator) Close() error {
 	return nil
 }
 
-func (itr *stringIntegerExprIterator) Next() *IntegerPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *stringIntegerExprIterator) Next() (*IntegerPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // stringIntegerExprFunc creates or modifies a point by combining two
@@ -4875,19 +5257,20 @@ func (itr *stringReduceStringIterator) Stats() IteratorStats { return itr.input.
 func (itr *stringReduceStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *stringReduceStringIterator) Next() *StringPoint {
+func (itr *stringReduceStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // stringReduceStringPoint stores the reduced data for a name/tag combination.
@@ -4900,16 +5283,22 @@ type stringReduceStringPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *stringReduceStringIterator) reduce() []StringPoint {
+func (itr *stringReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceStringPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -4941,7 +5330,9 @@ func (itr *stringReduceStringIterator) reduce() []StringPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
@@ -4958,10 +5349,10 @@ func (itr *stringReduceStringIterator) reduce() []StringPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// stringStreamStringIterator
+// stringStreamStringIterator streams inputs into the iterator and emits points gradually.
 type stringStreamStringIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, StringPointEmitter)
@@ -4970,6 +5361,7 @@ type stringStreamStringIterator struct {
 	points []StringPoint
 }
 
+// newStringStreamStringIterator returns a new instance of stringStreamStringIterator.
 func newStringStreamStringIterator(input StringIterator, createFn func() (StringPointAggregator, StringPointEmitter), opt IteratorOptions) *stringStreamStringIterator {
 	return &stringStreamStringIterator{
 		input:  newBufStringIterator(input),
@@ -4986,29 +5378,30 @@ func (itr *stringStreamStringIterator) Stats() IteratorStats { return itr.input.
 func (itr *stringStreamStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *stringStreamStringIterator) Next() *StringPoint {
+func (itr *stringStreamStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *stringStreamStringIterator) reduce() []StringPoint {
+func (itr *stringStreamStringIterator) reduce() ([]StringPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -5043,7 +5436,7 @@ func (itr *stringStreamStringIterator) reduce() []StringPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -5067,13 +5460,18 @@ func (itr *stringExprIterator) Close() error {
 	return nil
 }
 
-func (itr *stringExprIterator) Next() *StringPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *stringExprIterator) Next() (*StringPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // stringExprFunc creates or modifies a point by combining two
@@ -5097,19 +5495,20 @@ func (itr *stringReduceBooleanIterator) Stats() IteratorStats { return itr.input
 func (itr *stringReduceBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *stringReduceBooleanIterator) Next() *BooleanPoint {
+func (itr *stringReduceBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // stringReduceBooleanPoint stores the reduced data for a name/tag combination.
@@ -5122,16 +5521,22 @@ type stringReduceBooleanPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *stringReduceBooleanIterator) reduce() []BooleanPoint {
+func (itr *stringReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceBooleanPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -5163,7 +5568,9 @@ func (itr *stringReduceBooleanIterator) reduce() []BooleanPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
@@ -5180,10 +5587,10 @@ func (itr *stringReduceBooleanIterator) reduce() []BooleanPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// stringStreamBooleanIterator
+// stringStreamBooleanIterator streams inputs into the iterator and emits points gradually.
 type stringStreamBooleanIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, BooleanPointEmitter)
@@ -5192,6 +5599,7 @@ type stringStreamBooleanIterator struct {
 	points []BooleanPoint
 }
 
+// newStringStreamBooleanIterator returns a new instance of stringStreamBooleanIterator.
 func newStringStreamBooleanIterator(input StringIterator, createFn func() (StringPointAggregator, BooleanPointEmitter), opt IteratorOptions) *stringStreamBooleanIterator {
 	return &stringStreamBooleanIterator{
 		input:  newBufStringIterator(input),
@@ -5208,29 +5616,30 @@ func (itr *stringStreamBooleanIterator) Stats() IteratorStats { return itr.input
 func (itr *stringStreamBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *stringStreamBooleanIterator) Next() *BooleanPoint {
+func (itr *stringStreamBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *stringStreamBooleanIterator) reduce() []BooleanPoint {
+func (itr *stringStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -5265,7 +5674,7 @@ func (itr *stringStreamBooleanIterator) reduce() []BooleanPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -5289,13 +5698,18 @@ func (itr *stringBooleanExprIterator) Close() error {
 	return nil
 }
 
-func (itr *stringBooleanExprIterator) Next() *BooleanPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *stringBooleanExprIterator) Next() (*BooleanPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // stringBooleanExprFunc creates or modifies a point by combining two
@@ -5318,12 +5732,14 @@ func (itr *stringTransformIterator) Stats() IteratorStats { return itr.input.Sta
 func (itr *stringTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *stringTransformIterator) Next() *StringPoint {
-	p := itr.input.Next()
-	if p != nil {
+func (itr *stringTransformIterator) Next() (*StringPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
 		p = itr.fn(p)
 	}
-	return p
+	return p, nil
 }
 
 // stringTransformFunc creates or modifies a point.
@@ -5345,12 +5761,14 @@ func (itr *stringBoolTransformIterator) Stats() IteratorStats { return itr.input
 func (itr *stringBoolTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *stringBoolTransformIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
-	if p != nil {
-		return itr.fn(p)
+func (itr *stringBoolTransformIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
+		return itr.fn(p), nil
 	}
-	return nil
+	return nil, nil
 }
 
 // stringBoolTransformFunc creates or modifies a point.
@@ -5382,19 +5800,18 @@ func (itr *stringDedupeIterator) Stats() IteratorStats { return itr.input.Stats(
 func (itr *stringDedupeIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next unique point from the input iterator.
-func (itr *stringDedupeIterator) Next() *StringPoint {
+func (itr *stringDedupeIterator) Next() (*StringPoint, error) {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Serialize to bytes to store in lookup.
 		buf, err := proto.Marshal(encodeStringPoint(p))
 		if err != nil {
-			log.Println("error marshaling dedupe point:", err)
-			continue
+			return nil, err
 		}
 
 		// If the point has already been output then move to the next point.
@@ -5404,26 +5821,24 @@ func (itr *stringDedupeIterator) Next() *StringPoint {
 
 		// Otherwise mark it as emitted and return point.
 		itr.m[string(buf)] = struct{}{}
-		return p
+		return p, nil
 	}
 }
 
 // stringReaderIterator represents an iterator that streams from a reader.
 type stringReaderIterator struct {
-	r     io.Reader
-	dec   *StringPointDecoder
-	first *StringPoint
+	r   io.Reader
+	dec *StringPointDecoder
 }
 
 // newStringReaderIterator returns a new instance of stringReaderIterator.
-func newStringReaderIterator(r io.Reader, first *StringPoint, stats IteratorStats) *stringReaderIterator {
+func newStringReaderIterator(r io.Reader, stats IteratorStats) *stringReaderIterator {
 	dec := NewStringPointDecoder(r)
 	dec.stats = stats
 
 	return &stringReaderIterator{
-		r:     r,
-		dec:   dec,
-		first: first,
+		r:   r,
+		dec: dec,
 	}
 }
 
@@ -5439,31 +5854,23 @@ func (itr *stringReaderIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *stringReaderIterator) Next() *StringPoint {
-	// Send first point if it hasn't been sent yet.
-	if itr.first != nil {
-		p := itr.first
-		itr.first = nil
-		return p
-	}
-
+func (itr *stringReaderIterator) Next() (*StringPoint, error) {
 	// OPTIMIZE(benbjohnson): Reuse point on iterator.
 
 	// Unmarshal next point.
 	p := &StringPoint{}
 	if err := itr.dec.DecodeStringPoint(p); err == io.EOF {
-		return nil
+		return nil, nil
 	} else if err != nil {
-		log.Printf("error reading iterator point: %s", err)
-		return nil
+		return nil, err
 	}
-	return p
+	return p, nil
 }
 
 // BooleanIterator represents a stream of boolean points.
 type BooleanIterator interface {
 	Iterator
-	Next() *BooleanPoint
+	Next() (*BooleanPoint, error)
 }
 
 // newBooleanIterators converts a slice of Iterator to a slice of BooleanIterator.
@@ -5501,43 +5908,46 @@ func (itr *bufBooleanIterator) Stats() IteratorStats { return itr.itr.Stats() }
 func (itr *bufBooleanIterator) Close() error { return itr.itr.Close() }
 
 // peek returns the next point without removing it from the iterator.
-func (itr *bufBooleanIterator) peek() *BooleanPoint {
-	p := itr.Next()
+func (itr *bufBooleanIterator) peek() (*BooleanPoint, error) {
+	p, err := itr.Next()
+	if err != nil {
+		return nil, err
+	}
 	itr.unread(p)
-	return p
+	return p, nil
 }
 
 // peekTime returns the time of the next point.
 // Returns zero time if no more points available.
-func (itr *bufBooleanIterator) peekTime() int64 {
-	p := itr.peek()
-	if p == nil {
-		return ZeroTime
+func (itr *bufBooleanIterator) peekTime() (int64, error) {
+	p, err := itr.peek()
+	if p == nil || err != nil {
+		return ZeroTime, err
 	}
-	return p.Time
+	return p.Time, nil
 }
 
 // Next returns the current buffer, if exists, or calls the underlying iterator.
-func (itr *bufBooleanIterator) Next() *BooleanPoint {
-	if itr.buf != nil {
-		buf := itr.buf
+func (itr *bufBooleanIterator) Next() (*BooleanPoint, error) {
+	buf := itr.buf
+	if buf != nil {
 		itr.buf = nil
-		return buf
+		return buf, nil
 	}
 	return itr.itr.Next()
 }
 
 // NextInWindow returns the next value if it is between [startTime, endTime).
 // If the next value is outside the range then it is moved to the buffer.
-func (itr *bufBooleanIterator) NextInWindow(startTime, endTime int64) *BooleanPoint {
-	v := itr.Next()
-	if v == nil {
-		return nil
-	} else if v.Time < startTime || v.Time >= endTime {
+func (itr *bufBooleanIterator) NextInWindow(startTime, endTime int64) (*BooleanPoint, error) {
+	v, err := itr.Next()
+	if v == nil || err != nil {
+		return nil, err
+	} else if t := v.Time; t >= endTime || t < startTime {
 		itr.unread(v)
-		return nil
+		return nil, nil
 	}
-	return v
+	return v, nil
 }
 
 // unread sets v to the buffer. It is read on the next call to Next().
@@ -5599,7 +6009,7 @@ func (itr *booleanMergeIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *booleanMergeIterator) Next() *BooleanPoint {
+func (itr *booleanMergeIterator) Next() (*BooleanPoint, error) {
 	// Initialize the heap. This needs to be done lazily on the first call to this iterator
 	// so that iterator initialization done through the Select() call returns quickly.
 	// Queries can only be interrupted after the Select() call completes so any operations
@@ -5609,7 +6019,9 @@ func (itr *booleanMergeIterator) Next() *BooleanPoint {
 		items := itr.heap.items
 		itr.heap.items = make([]*booleanMergeHeapItem, 0, len(items))
 		for _, item := range items {
-			if item.itr.peek() == nil {
+			if p, err := item.itr.peek(); err != nil {
+				return nil, err
+			} else if p == nil {
 				continue
 			}
 			itr.heap.items = append(itr.heap.items, item)
@@ -5622,19 +6034,25 @@ func (itr *booleanMergeIterator) Next() *BooleanPoint {
 		// Retrieve the next iterator if we don't have one.
 		if itr.curr == nil {
 			if len(itr.heap.items) == 0 {
-				return nil
+				return nil, nil
 			}
 			itr.curr = heap.Pop(itr.heap).(*booleanMergeHeapItem)
 
 			// Read point and set current window.
-			p := itr.curr.itr.Next()
+			p, err := itr.curr.itr.Next()
+			if err != nil {
+				return nil, err
+			}
 			itr.window.name, itr.window.tags = p.Name, p.Tags.ID()
 			itr.window.startTime, itr.window.endTime = itr.heap.opt.Window(p.Time)
-			return p
+			return p, nil
 		}
 
 		// Read the next point from the current iterator.
-		p := itr.curr.itr.Next()
+		p, err := itr.curr.itr.Next()
+		if err != nil {
+			return nil, err
+		}
 
 		// If there are no more points then remove iterator from heap and find next.
 		if p == nil {
@@ -5644,13 +6062,13 @@ func (itr *booleanMergeIterator) Next() *BooleanPoint {
 
 		// Check if the point is inside of our current window.
 		inWindow := true
-		if itr.window.name != p.Name {
+		if window := itr.window; window.name != p.Name {
 			inWindow = false
-		} else if itr.window.tags != p.Tags.ID() {
+		} else if window.tags != p.Tags.ID() {
 			inWindow = false
-		} else if itr.heap.opt.Ascending && p.Time >= itr.window.endTime {
+		} else if opt := itr.heap.opt; opt.Ascending && p.Time >= window.endTime {
 			inWindow = false
-		} else if !itr.heap.opt.Ascending && p.Time < itr.window.startTime {
+		} else if !opt.Ascending && p.Time < window.startTime {
 			inWindow = false
 		}
 
@@ -5662,7 +6080,7 @@ func (itr *booleanMergeIterator) Next() *BooleanPoint {
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -5676,7 +6094,14 @@ type booleanMergeHeap struct {
 func (h booleanMergeHeap) Len() int      { return len(h.items) }
 func (h booleanMergeHeap) Swap(i, j int) { h.items[i], h.items[j] = h.items[j], h.items[i] }
 func (h booleanMergeHeap) Less(i, j int) bool {
-	x, y := h.items[i].itr.peek(), h.items[j].itr.peek()
+	x, err := h.items[i].itr.peek()
+	if err != nil {
+		return true
+	}
+	y, err := h.items[j].itr.peek()
+	if err != nil {
+		return false
+	}
 
 	if h.opt.Ascending {
 		if x.Name != y.Name {
@@ -5715,6 +6140,7 @@ func (h *booleanMergeHeap) Pop() interface{} {
 
 type booleanMergeHeapItem struct {
 	itr *bufBooleanIterator
+	err error
 }
 
 // booleanSortedMergeIterator is an iterator that sorts and merges multiple iterators into one.
@@ -5722,6 +6148,8 @@ type booleanSortedMergeIterator struct {
 	inputs []BooleanIterator
 	opt    IteratorOptions
 	heap   booleanSortedMergeHeap
+	init   bool
+	point  BooleanPoint
 }
 
 // newBooleanSortedMergeIterator returns an instance of booleanSortedMergeIterator.
@@ -5732,18 +6160,11 @@ func newBooleanSortedMergeIterator(inputs []BooleanIterator, opt IteratorOptions
 		opt:    opt,
 	}
 
-	// Initialize heap.
+	// Initialize heap items.
 	for _, input := range inputs {
-		// Read next point.
-		p := input.Next()
-		if p == nil {
-			continue
-		}
-
 		// Append to the heap.
-		itr.heap = append(itr.heap, &booleanSortedMergeHeapItem{point: p, itr: input, ascending: opt.Ascending})
+		itr.heap = append(itr.heap, &booleanSortedMergeHeapItem{itr: input, ascending: opt.Ascending})
 	}
-	heap.Init(&itr.heap)
 
 	return itr
 }
@@ -5766,27 +6187,49 @@ func (itr *booleanSortedMergeIterator) Close() error {
 }
 
 // Next returns the next points from the iterator.
-func (itr *booleanSortedMergeIterator) Next() *BooleanPoint { return itr.pop() }
+func (itr *booleanSortedMergeIterator) Next() (*BooleanPoint, error) { return itr.pop() }
 
 // pop returns the next point from the heap.
 // Reads the next point from item's cursor and puts it back on the heap.
-func (itr *booleanSortedMergeIterator) pop() *BooleanPoint {
+func (itr *booleanSortedMergeIterator) pop() (*BooleanPoint, error) {
+	// Initialize the heap. See the MergeIterator to see why this has to be done lazily.
+	if !itr.init {
+		items := itr.heap
+		itr.heap = make([]*booleanSortedMergeHeapItem, 0, len(items))
+		for _, item := range items {
+			var err error
+			if item.point, err = item.itr.Next(); err != nil {
+				return nil, err
+			} else if item.point == nil {
+				continue
+			}
+			itr.heap = append(itr.heap, item)
+		}
+		heap.Init(&itr.heap)
+		itr.init = true
+	}
+
 	if len(itr.heap) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// Read the next item from the heap.
 	item := heap.Pop(&itr.heap).(*booleanSortedMergeHeapItem)
+	if item.err != nil {
+		return nil, item.err
+	} else if item.point == nil {
+		return nil, nil
+	}
 
 	// Copy the point for return.
 	p := item.point.Clone()
 
 	// Read the next item from the cursor. Push back to heap if one exists.
-	if item.point = item.itr.Next(); item.point != nil {
+	if item.point, item.err = item.itr.Next(); item.point != nil {
 		heap.Push(&itr.heap, item)
 	}
 
-	return p
+	return p, nil
 }
 
 // booleanSortedMergeHeap represents a heap of booleanSortedMergeHeapItems.
@@ -5828,6 +6271,7 @@ func (h *booleanSortedMergeHeap) Pop() interface{} {
 
 type booleanSortedMergeHeapItem struct {
 	point     *BooleanPoint
+	err       error
 	itr       BooleanIterator
 	ascending bool
 }
@@ -5859,11 +6303,11 @@ func (itr *booleanLimitIterator) Stats() IteratorStats { return itr.input.Stats(
 func (itr *booleanLimitIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next point from the iterator.
-func (itr *booleanLimitIterator) Next() *BooleanPoint {
+func (itr *booleanLimitIterator) Next() (*BooleanPoint, error) {
 	for {
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Reset window and counter if a new window is encountered.
@@ -5885,12 +6329,12 @@ func (itr *booleanLimitIterator) Next() *BooleanPoint {
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
 			// If there's no interval, no groups, and a single source then simply exit.
 			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil
+				return nil, nil
 			}
 			continue
 		}
 
-		return p
+		return p, nil
 	}
 }
 
@@ -5900,7 +6344,7 @@ type booleanFillIterator struct {
 	startTime int64
 	endTime   int64
 	auxFields []interface{}
-	done      bool
+	init      bool
 	opt       IteratorOptions
 
 	window struct {
@@ -5921,9 +6365,9 @@ func newBooleanFillIterator(input BooleanIterator, expr Expr, opt IteratorOption
 	var startTime, endTime int64
 	if opt.Ascending {
 		startTime, _ = opt.Window(opt.StartTime)
-		_, endTime = opt.Window(opt.EndTime)
+		endTime, _ = opt.Window(opt.EndTime)
 	} else {
-		_, startTime = opt.Window(opt.EndTime)
+		startTime, _ = opt.Window(opt.EndTime)
 		endTime, _ = opt.Window(opt.StartTime)
 	}
 
@@ -5932,36 +6376,40 @@ func newBooleanFillIterator(input BooleanIterator, expr Expr, opt IteratorOption
 		auxFields = make([]interface{}, len(opt.Aux))
 	}
 
-	itr := &booleanFillIterator{
+	return &booleanFillIterator{
 		input:     newBufBooleanIterator(input),
 		startTime: startTime,
 		endTime:   endTime,
 		auxFields: auxFields,
 		opt:       opt,
 	}
-
-	p := itr.input.peek()
-	if p != nil {
-		itr.window.name, itr.window.tags = p.Name, p.Tags
-		itr.window.time = itr.startTime
-	} else {
-		itr.window.time = itr.endTime
-	}
-	return itr
 }
 
 func (itr *booleanFillIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *booleanFillIterator) Close() error         { return itr.input.Close() }
 
-func (itr *booleanFillIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
+func (itr *booleanFillIterator) Next() (*BooleanPoint, error) {
+	if !itr.init {
+		p, err := itr.input.peek()
+		if p == nil || err != nil {
+			return nil, err
+		}
+		itr.window.name, itr.window.tags = p.Name, p.Tags
+		itr.window.time = itr.startTime
+		itr.init = true
+	}
+
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	}
 
 	// Check if the next point is outside of our window or is nil.
 	for p == nil || p.Name != itr.window.name || p.Tags.ID() != itr.window.tags.ID() {
 		// If we are inside of an interval, unread the point and continue below to
 		// constructing a new point.
 		if itr.opt.Ascending {
-			if itr.window.time < itr.endTime {
+			if itr.window.time <= itr.endTime {
 				itr.input.unread(p)
 				p = nil
 				break
@@ -5977,7 +6425,7 @@ func (itr *booleanFillIterator) Next() *BooleanPoint {
 		// We are *not* in a current interval. If there is no next point,
 		// we are at the end of all intervals.
 		if p == nil {
-			return nil
+			return nil, nil
 		}
 
 		// Set the new interval.
@@ -5988,7 +6436,7 @@ func (itr *booleanFillIterator) Next() *BooleanPoint {
 	}
 
 	// Check if the point is our next expected point.
-	if p == nil || p.Time > itr.window.time {
+	if p == nil || (itr.opt.Ascending && p.Time > itr.window.time) || (!itr.opt.Ascending && p.Time < itr.window.time) {
 		if p != nil {
 			itr.input.unread(p)
 		}
@@ -6025,7 +6473,7 @@ func (itr *booleanFillIterator) Next() *BooleanPoint {
 	} else {
 		itr.window.time = p.Time - int64(itr.opt.Interval.Duration)
 	}
-	return p
+	return p, nil
 }
 
 // booleanIntervalIterator represents a boolean implementation of IntervalIterator.
@@ -6041,13 +6489,13 @@ func newBooleanIntervalIterator(input BooleanIterator, opt IteratorOptions) *boo
 func (itr *booleanIntervalIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *booleanIntervalIterator) Close() error         { return itr.input.Close() }
 
-func (itr *booleanIntervalIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
-	if p == nil {
-		return p
+func (itr *booleanIntervalIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if p == nil || err != nil {
+		return nil, err
 	}
 	p.Time, _ = itr.opt.Window(p.Time)
-	return p
+	return p, nil
 }
 
 // booleanInterruptIterator represents a boolean implementation of InterruptIterator.
@@ -6064,15 +6512,15 @@ func newBooleanInterruptIterator(input BooleanIterator, closing <-chan struct{})
 func (itr *booleanInterruptIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *booleanInterruptIterator) Close() error         { return itr.input.Close() }
 
-func (itr *booleanInterruptIterator) Next() *BooleanPoint {
-	// Only check if the channel is closed every 256 points. This
-	// intentionally checks on both 0 and 256 so that if the iterator
+func (itr *booleanInterruptIterator) Next() (*BooleanPoint, error) {
+	// Only check if the channel is closed every N points. This
+	// intentionally checks on both 0 and N so that if the iterator
 	// has been interrupted before the first point is emitted it will
 	// not emit any points.
-	if itr.count&0x100 == 0 {
+	if itr.count&0xFF == 0xFF {
 		select {
 		case <-itr.closing:
-			return nil
+			return nil, nil
 		default:
 			// Reset iterator count to zero and fall through to emit the next point.
 			itr.count = 0
@@ -6084,10 +6532,16 @@ func (itr *booleanInterruptIterator) Next() *BooleanPoint {
 	return itr.input.Next()
 }
 
+// auxBooleanPoint represents a combination of a point and an error for the AuxIterator.
+type auxBooleanPoint struct {
+	point *BooleanPoint
+	err   error
+}
+
 // booleanAuxIterator represents a boolean implementation of AuxIterator.
 type booleanAuxIterator struct {
 	input      *bufBooleanIterator
-	output     chan *BooleanPoint
+	output     chan auxBooleanPoint
 	fields     auxIteratorFields
 	background bool
 }
@@ -6095,7 +6549,7 @@ type booleanAuxIterator struct {
 func newBooleanAuxIterator(input BooleanIterator, seriesKeys SeriesList, opt IteratorOptions) *booleanAuxIterator {
 	return &booleanAuxIterator{
 		input:  newBufBooleanIterator(input),
-		output: make(chan *BooleanPoint, 1),
+		output: make(chan auxBooleanPoint, 1),
 		fields: newAuxIteratorFields(seriesKeys, opt),
 	}
 }
@@ -6103,13 +6557,16 @@ func newBooleanAuxIterator(input BooleanIterator, seriesKeys SeriesList, opt Ite
 func (itr *booleanAuxIterator) Background() {
 	itr.background = true
 	itr.Start()
-	go drainIterator(itr)
+	go DrainIterator(itr)
 }
 
-func (itr *booleanAuxIterator) Start()                        { go itr.stream() }
-func (itr *booleanAuxIterator) Stats() IteratorStats          { return itr.input.Stats() }
-func (itr *booleanAuxIterator) Close() error                  { return itr.input.Close() }
-func (itr *booleanAuxIterator) Next() *BooleanPoint           { return <-itr.output }
+func (itr *booleanAuxIterator) Start()               { go itr.stream() }
+func (itr *booleanAuxIterator) Stats() IteratorStats { return itr.input.Stats() }
+func (itr *booleanAuxIterator) Close() error         { return itr.input.Close() }
+func (itr *booleanAuxIterator) Next() (*BooleanPoint, error) {
+	p := <-itr.output
+	return p.point, p.err
+}
 func (itr *booleanAuxIterator) Iterator(name string) Iterator { return itr.fields.iterator(name) }
 
 func (itr *booleanAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
@@ -6141,13 +6598,17 @@ func (itr *booleanAuxIterator) ExpandSources(sources Sources) (Sources, error) {
 func (itr *booleanAuxIterator) stream() {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
+		p, err := itr.input.Next()
+		if err != nil {
+			itr.output <- auxBooleanPoint{err: err}
+			itr.fields.sendError(err)
+			break
+		} else if p == nil {
 			break
 		}
 
 		// Send point to output and to each field iterator.
-		itr.output <- p
+		itr.output <- auxBooleanPoint{point: p}
 		if ok := itr.fields.send(p); !ok && itr.background {
 			break
 		}
@@ -6159,7 +6620,12 @@ func (itr *booleanAuxIterator) stream() {
 
 // booleanChanIterator represents a new instance of booleanChanIterator.
 type booleanChanIterator struct {
-	buf  *BooleanPoint
+	buf struct {
+		i      int
+		filled bool
+		points [2]BooleanPoint
+	}
+	err  error
 	cond *sync.Cond
 	done bool
 }
@@ -6182,7 +6648,7 @@ func (itr *booleanChanIterator) setBuf(name string, tags Tags, time int64, value
 
 	// Wait for either the iterator to be done (so we don't have to set the value)
 	// or for the buffer to have been read and ready for another write.
-	for !itr.done && itr.buf != nil {
+	for !itr.done && itr.buf.filled {
 		itr.cond.Wait()
 	}
 
@@ -6195,35 +6661,55 @@ func (itr *booleanChanIterator) setBuf(name string, tags Tags, time int64, value
 
 	switch v := value.(type) {
 	case bool:
-		itr.buf = &BooleanPoint{Name: name, Tags: tags, Time: time, Value: v}
+		itr.buf.points[itr.buf.i] = BooleanPoint{Name: name, Tags: tags, Time: time, Value: v}
 
 	default:
-		itr.buf = &BooleanPoint{Name: name, Tags: tags, Time: time, Nil: true}
+		itr.buf.points[itr.buf.i] = BooleanPoint{Name: name, Tags: tags, Time: time, Nil: true}
 	}
+	itr.buf.filled = true
+
 	// Signal to all waiting goroutines that a new value is ready to read.
 	itr.cond.Signal()
 	return true
 }
 
-func (itr *booleanChanIterator) Next() *BooleanPoint {
+func (itr *booleanChanIterator) setErr(err error) {
 	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+	itr.err = err
+
+	// Signal to all waiting goroutines that a new value is ready to read.
+	itr.cond.Signal()
+}
+
+func (itr *booleanChanIterator) Next() (*BooleanPoint, error) {
+	itr.cond.L.Lock()
+	defer itr.cond.L.Unlock()
+
+	// Check for an error and return one if there.
+	if itr.err != nil {
+		return nil, itr.err
+	}
 
 	// Wait until either a value is available in the buffer or
 	// the iterator is closed.
-	for !itr.done && itr.buf == nil {
+	for !itr.done && !itr.buf.filled {
 		itr.cond.Wait()
+	}
+
+	// Return nil once the channel is done and the buffer is empty.
+	if itr.done && !itr.buf.filled {
+		return nil, nil
 	}
 
 	// Always read from the buffer if it exists, even if the iterator
 	// is closed. This prevents the last value from being truncated by
 	// the parent iterator.
-	p := itr.buf
-	itr.buf = nil
+	p := &itr.buf.points[itr.buf.i]
+	itr.buf.i = (itr.buf.i + 1) % len(itr.buf.points)
+	itr.buf.filled = false
 	itr.cond.Signal()
-
-	// Do not defer the unlock so we don't create an unnecessary allocation.
-	itr.cond.L.Unlock()
-	return p
+	return p, nil
 }
 
 // booleanReduceFloatIterator executes a reducer for every interval and buffers the result.
@@ -6241,19 +6727,20 @@ func (itr *booleanReduceFloatIterator) Stats() IteratorStats { return itr.input.
 func (itr *booleanReduceFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *booleanReduceFloatIterator) Next() *FloatPoint {
+func (itr *booleanReduceFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // booleanReduceFloatPoint stores the reduced data for a name/tag combination.
@@ -6266,16 +6753,22 @@ type booleanReduceFloatPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *booleanReduceFloatIterator) reduce() []FloatPoint {
+func (itr *booleanReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceFloatPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -6307,7 +6800,9 @@ func (itr *booleanReduceFloatIterator) reduce() []FloatPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
@@ -6324,10 +6819,10 @@ func (itr *booleanReduceFloatIterator) reduce() []FloatPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// booleanStreamFloatIterator
+// booleanStreamFloatIterator streams inputs into the iterator and emits points gradually.
 type booleanStreamFloatIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, FloatPointEmitter)
@@ -6336,6 +6831,7 @@ type booleanStreamFloatIterator struct {
 	points []FloatPoint
 }
 
+// newBooleanStreamFloatIterator returns a new instance of booleanStreamFloatIterator.
 func newBooleanStreamFloatIterator(input BooleanIterator, createFn func() (BooleanPointAggregator, FloatPointEmitter), opt IteratorOptions) *booleanStreamFloatIterator {
 	return &booleanStreamFloatIterator{
 		input:  newBufBooleanIterator(input),
@@ -6352,29 +6848,30 @@ func (itr *booleanStreamFloatIterator) Stats() IteratorStats { return itr.input.
 func (itr *booleanStreamFloatIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *booleanStreamFloatIterator) Next() *FloatPoint {
+func (itr *booleanStreamFloatIterator) Next() (*FloatPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *booleanStreamFloatIterator) reduce() []FloatPoint {
+func (itr *booleanStreamFloatIterator) reduce() ([]FloatPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -6409,7 +6906,7 @@ func (itr *booleanStreamFloatIterator) reduce() []FloatPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -6433,13 +6930,18 @@ func (itr *booleanFloatExprIterator) Close() error {
 	return nil
 }
 
-func (itr *booleanFloatExprIterator) Next() *FloatPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *booleanFloatExprIterator) Next() (*FloatPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // booleanFloatExprFunc creates or modifies a point by combining two
@@ -6463,19 +6965,20 @@ func (itr *booleanReduceIntegerIterator) Stats() IteratorStats { return itr.inpu
 func (itr *booleanReduceIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *booleanReduceIntegerIterator) Next() *IntegerPoint {
+func (itr *booleanReduceIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // booleanReduceIntegerPoint stores the reduced data for a name/tag combination.
@@ -6488,16 +6991,22 @@ type booleanReduceIntegerPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *booleanReduceIntegerIterator) reduce() []IntegerPoint {
+func (itr *booleanReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceIntegerPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -6529,7 +7038,9 @@ func (itr *booleanReduceIntegerIterator) reduce() []IntegerPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
@@ -6546,10 +7057,10 @@ func (itr *booleanReduceIntegerIterator) reduce() []IntegerPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// booleanStreamIntegerIterator
+// booleanStreamIntegerIterator streams inputs into the iterator and emits points gradually.
 type booleanStreamIntegerIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, IntegerPointEmitter)
@@ -6558,6 +7069,7 @@ type booleanStreamIntegerIterator struct {
 	points []IntegerPoint
 }
 
+// newBooleanStreamIntegerIterator returns a new instance of booleanStreamIntegerIterator.
 func newBooleanStreamIntegerIterator(input BooleanIterator, createFn func() (BooleanPointAggregator, IntegerPointEmitter), opt IteratorOptions) *booleanStreamIntegerIterator {
 	return &booleanStreamIntegerIterator{
 		input:  newBufBooleanIterator(input),
@@ -6574,29 +7086,30 @@ func (itr *booleanStreamIntegerIterator) Stats() IteratorStats { return itr.inpu
 func (itr *booleanStreamIntegerIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *booleanStreamIntegerIterator) Next() *IntegerPoint {
+func (itr *booleanStreamIntegerIterator) Next() (*IntegerPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *booleanStreamIntegerIterator) reduce() []IntegerPoint {
+func (itr *booleanStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -6631,7 +7144,7 @@ func (itr *booleanStreamIntegerIterator) reduce() []IntegerPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -6655,13 +7168,18 @@ func (itr *booleanIntegerExprIterator) Close() error {
 	return nil
 }
 
-func (itr *booleanIntegerExprIterator) Next() *IntegerPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *booleanIntegerExprIterator) Next() (*IntegerPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // booleanIntegerExprFunc creates or modifies a point by combining two
@@ -6685,19 +7203,20 @@ func (itr *booleanReduceStringIterator) Stats() IteratorStats { return itr.input
 func (itr *booleanReduceStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *booleanReduceStringIterator) Next() *StringPoint {
+func (itr *booleanReduceStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // booleanReduceStringPoint stores the reduced data for a name/tag combination.
@@ -6710,16 +7229,22 @@ type booleanReduceStringPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *booleanReduceStringIterator) reduce() []StringPoint {
+func (itr *booleanReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceStringPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -6751,7 +7276,9 @@ func (itr *booleanReduceStringIterator) reduce() []StringPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
@@ -6768,10 +7295,10 @@ func (itr *booleanReduceStringIterator) reduce() []StringPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// booleanStreamStringIterator
+// booleanStreamStringIterator streams inputs into the iterator and emits points gradually.
 type booleanStreamStringIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, StringPointEmitter)
@@ -6780,6 +7307,7 @@ type booleanStreamStringIterator struct {
 	points []StringPoint
 }
 
+// newBooleanStreamStringIterator returns a new instance of booleanStreamStringIterator.
 func newBooleanStreamStringIterator(input BooleanIterator, createFn func() (BooleanPointAggregator, StringPointEmitter), opt IteratorOptions) *booleanStreamStringIterator {
 	return &booleanStreamStringIterator{
 		input:  newBufBooleanIterator(input),
@@ -6796,29 +7324,30 @@ func (itr *booleanStreamStringIterator) Stats() IteratorStats { return itr.input
 func (itr *booleanStreamStringIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *booleanStreamStringIterator) Next() *StringPoint {
+func (itr *booleanStreamStringIterator) Next() (*StringPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *booleanStreamStringIterator) reduce() []StringPoint {
+func (itr *booleanStreamStringIterator) reduce() ([]StringPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -6853,7 +7382,7 @@ func (itr *booleanStreamStringIterator) reduce() []StringPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -6877,13 +7406,18 @@ func (itr *booleanStringExprIterator) Close() error {
 	return nil
 }
 
-func (itr *booleanStringExprIterator) Next() *StringPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *booleanStringExprIterator) Next() (*StringPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // booleanStringExprFunc creates or modifies a point by combining two
@@ -6907,19 +7441,20 @@ func (itr *booleanReduceBooleanIterator) Stats() IteratorStats { return itr.inpu
 func (itr *booleanReduceBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *booleanReduceBooleanIterator) Next() *BooleanPoint {
+func (itr *booleanReduceBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // booleanReduceBooleanPoint stores the reduced data for a name/tag combination.
@@ -6932,16 +7467,22 @@ type booleanReduceBooleanPoint struct {
 
 // reduce executes fn once for every point in the next window.
 // The previous value for the dimension is passed to fn.
-func (itr *booleanReduceBooleanIterator) reduce() []BooleanPoint {
+func (itr *booleanReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	startTime, endTime := itr.opt.Window(itr.input.peekTime())
+	t, err := itr.input.peekTime()
+	if err != nil {
+		return nil, err
+	}
+	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceBooleanPoint)
 	for {
 		// Read next point.
-		curr := itr.input.NextInWindow(startTime, endTime)
-		if curr == nil {
+		curr, err := itr.input.NextInWindow(startTime, endTime)
+		if err != nil {
+			return nil, err
+		} else if curr == nil {
 			break
 		} else if curr.Nil {
 			continue
@@ -6973,7 +7514,9 @@ func (itr *booleanReduceBooleanIterator) reduce() []BooleanPoint {
 	for k := range m {
 		keys = append(keys, k)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(keys)))
+	if len(keys) > 1 {
+		sort.Sort(reverseStringSlice(keys))
+	}
 
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
@@ -6990,10 +7533,10 @@ func (itr *booleanReduceBooleanIterator) reduce() []BooleanPoint {
 		}
 	}
 
-	return a
+	return a, nil
 }
 
-// booleanStreamBooleanIterator
+// booleanStreamBooleanIterator streams inputs into the iterator and emits points gradually.
 type booleanStreamBooleanIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, BooleanPointEmitter)
@@ -7002,6 +7545,7 @@ type booleanStreamBooleanIterator struct {
 	points []BooleanPoint
 }
 
+// newBooleanStreamBooleanIterator returns a new instance of booleanStreamBooleanIterator.
 func newBooleanStreamBooleanIterator(input BooleanIterator, createFn func() (BooleanPointAggregator, BooleanPointEmitter), opt IteratorOptions) *booleanStreamBooleanIterator {
 	return &booleanStreamBooleanIterator{
 		input:  newBufBooleanIterator(input),
@@ -7018,29 +7562,30 @@ func (itr *booleanStreamBooleanIterator) Stats() IteratorStats { return itr.inpu
 func (itr *booleanStreamBooleanIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next value for the stream iterator.
-func (itr *booleanStreamBooleanIterator) Next() *BooleanPoint {
+func (itr *booleanStreamBooleanIterator) Next() (*BooleanPoint, error) {
 	// Calculate next window if we have no more points.
 	if len(itr.points) == 0 {
-		itr.points = itr.reduce()
+		var err error
+		itr.points, err = itr.reduce()
 		if len(itr.points) == 0 {
-			return nil
+			return nil, err
 		}
 	}
 
 	// Pop next point off the stack.
 	p := &itr.points[len(itr.points)-1]
 	itr.points = itr.points[:len(itr.points)-1]
-	return p
+	return p, nil
 }
 
 // reduce creates and manages aggregators for every point from the input.
 // After aggregating a point, it always tries to emit a value using the emitter.
-func (itr *booleanStreamBooleanIterator) reduce() []BooleanPoint {
+func (itr *booleanStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 	for {
 		// Read next point.
-		curr := itr.input.Next()
-		if curr == nil {
-			return nil
+		curr, err := itr.input.Next()
+		if curr == nil || err != nil {
+			return nil, err
 		} else if curr.Nil {
 			continue
 		}
@@ -7075,7 +7620,7 @@ func (itr *booleanStreamBooleanIterator) reduce() []BooleanPoint {
 			points[i].Name = rp.Name
 			points[i].Tags = rp.Tags
 		}
-		return points
+		return points, nil
 	}
 }
 
@@ -7099,13 +7644,18 @@ func (itr *booleanExprIterator) Close() error {
 	return nil
 }
 
-func (itr *booleanExprIterator) Next() *BooleanPoint {
-	a := itr.left.Next()
-	b := itr.right.Next()
-	if a == nil && b == nil {
-		return nil
+func (itr *booleanExprIterator) Next() (*BooleanPoint, error) {
+	a, err := itr.left.Next()
+	if err != nil {
+		return nil, err
 	}
-	return itr.fn(a, b)
+	b, err := itr.right.Next()
+	if err != nil {
+		return nil, err
+	} else if a == nil && b == nil {
+		return nil, nil
+	}
+	return itr.fn(a, b), nil
 }
 
 // booleanExprFunc creates or modifies a point by combining two
@@ -7128,12 +7678,14 @@ func (itr *booleanTransformIterator) Stats() IteratorStats { return itr.input.St
 func (itr *booleanTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *booleanTransformIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
-	if p != nil {
+func (itr *booleanTransformIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
 		p = itr.fn(p)
 	}
-	return p
+	return p, nil
 }
 
 // booleanTransformFunc creates or modifies a point.
@@ -7155,12 +7707,14 @@ func (itr *booleanBoolTransformIterator) Stats() IteratorStats { return itr.inpu
 func (itr *booleanBoolTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *booleanBoolTransformIterator) Next() *BooleanPoint {
-	p := itr.input.Next()
-	if p != nil {
-		return itr.fn(p)
+func (itr *booleanBoolTransformIterator) Next() (*BooleanPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
+		return itr.fn(p), nil
 	}
-	return nil
+	return nil, nil
 }
 
 // booleanBoolTransformFunc creates or modifies a point.
@@ -7192,19 +7746,18 @@ func (itr *booleanDedupeIterator) Stats() IteratorStats { return itr.input.Stats
 func (itr *booleanDedupeIterator) Close() error { return itr.input.Close() }
 
 // Next returns the next unique point from the input iterator.
-func (itr *booleanDedupeIterator) Next() *BooleanPoint {
+func (itr *booleanDedupeIterator) Next() (*BooleanPoint, error) {
 	for {
 		// Read next point.
-		p := itr.input.Next()
-		if p == nil {
-			return nil
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
 		}
 
 		// Serialize to bytes to store in lookup.
 		buf, err := proto.Marshal(encodeBooleanPoint(p))
 		if err != nil {
-			log.Println("error marshaling dedupe point:", err)
-			continue
+			return nil, err
 		}
 
 		// If the point has already been output then move to the next point.
@@ -7214,26 +7767,24 @@ func (itr *booleanDedupeIterator) Next() *BooleanPoint {
 
 		// Otherwise mark it as emitted and return point.
 		itr.m[string(buf)] = struct{}{}
-		return p
+		return p, nil
 	}
 }
 
 // booleanReaderIterator represents an iterator that streams from a reader.
 type booleanReaderIterator struct {
-	r     io.Reader
-	dec   *BooleanPointDecoder
-	first *BooleanPoint
+	r   io.Reader
+	dec *BooleanPointDecoder
 }
 
 // newBooleanReaderIterator returns a new instance of booleanReaderIterator.
-func newBooleanReaderIterator(r io.Reader, first *BooleanPoint, stats IteratorStats) *booleanReaderIterator {
+func newBooleanReaderIterator(r io.Reader, stats IteratorStats) *booleanReaderIterator {
 	dec := NewBooleanPointDecoder(r)
 	dec.stats = stats
 
 	return &booleanReaderIterator{
-		r:     r,
-		dec:   dec,
-		first: first,
+		r:   r,
+		dec: dec,
 	}
 }
 
@@ -7249,25 +7800,17 @@ func (itr *booleanReaderIterator) Close() error {
 }
 
 // Next returns the next point from the iterator.
-func (itr *booleanReaderIterator) Next() *BooleanPoint {
-	// Send first point if it hasn't been sent yet.
-	if itr.first != nil {
-		p := itr.first
-		itr.first = nil
-		return p
-	}
-
+func (itr *booleanReaderIterator) Next() (*BooleanPoint, error) {
 	// OPTIMIZE(benbjohnson): Reuse point on iterator.
 
 	// Unmarshal next point.
 	p := &BooleanPoint{}
 	if err := itr.dec.DecodeBooleanPoint(p); err == io.EOF {
-		return nil
+		return nil, nil
 	} else if err != nil {
-		log.Printf("error reading iterator point: %s", err)
-		return nil
+		return nil, err
 	}
-	return p
+	return p, nil
 }
 
 // IteratorEncoder is an encoder for encoding an iterator's points to w.
@@ -7326,8 +7869,10 @@ func (enc *IteratorEncoder) encodeFloatIterator(itr FloatIterator) error {
 		}
 
 		// Retrieve the next point from the iterator.
-		p := itr.Next()
-		if p == nil {
+		p, err := itr.Next()
+		if err != nil {
+			return err
+		} else if p == nil {
 			break
 		}
 
@@ -7367,8 +7912,10 @@ func (enc *IteratorEncoder) encodeIntegerIterator(itr IntegerIterator) error {
 		}
 
 		// Retrieve the next point from the iterator.
-		p := itr.Next()
-		if p == nil {
+		p, err := itr.Next()
+		if err != nil {
+			return err
+		} else if p == nil {
 			break
 		}
 
@@ -7408,8 +7955,10 @@ func (enc *IteratorEncoder) encodeStringIterator(itr StringIterator) error {
 		}
 
 		// Retrieve the next point from the iterator.
-		p := itr.Next()
-		if p == nil {
+		p, err := itr.Next()
+		if err != nil {
+			return err
+		} else if p == nil {
 			break
 		}
 
@@ -7449,8 +7998,10 @@ func (enc *IteratorEncoder) encodeBooleanIterator(itr BooleanIterator) error {
 		}
 
 		// Retrieve the next point from the iterator.
-		p := itr.Next()
-		if p == nil {
+		p, err := itr.Next()
+		if err != nil {
+			return err
+		} else if p == nil {
 			break
 		}
 

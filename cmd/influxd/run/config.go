@@ -2,14 +2,18 @@ package run
 
 import (
 	"fmt"
+	"io/ioutil"
+	"log"
 	"os"
 	"os/user"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/influxdata/influxdb/cluster"
 	"github.com/influxdata/influxdb/monitor"
 	"github.com/influxdata/influxdb/services/admin"
@@ -44,15 +48,15 @@ type Config struct {
 	Retention  retention.Config  `toml:"retention"`
 	Precreator precreator.Config `toml:"shard-precreation"`
 
-	Admin      admin.Config      `toml:"admin"`
-	Monitor    monitor.Config    `toml:"monitor"`
-	Subscriber subscriber.Config `toml:"subscriber"`
-	HTTPD      httpd.Config      `toml:"http"`
-	Graphites  []graphite.Config `toml:"graphite"`
-	Collectd   collectd.Config   `toml:"collectd"`
-	OpenTSDB   opentsdb.Config   `toml:"opentsdb"`
-	UDPs       []udp.Config      `toml:"udp"`
-	Replicator replicator.Config `toml:"replicator"`
+	Admin          admin.Config      `toml:"admin"`
+	Monitor        monitor.Config    `toml:"monitor"`
+	Subscriber     subscriber.Config `toml:"subscriber"`
+	HTTPD          httpd.Config      `toml:"http"`
+	GraphiteInputs []graphite.Config `toml:"graphite"`
+	CollectdInputs []collectd.Config `toml:"collectd"`
+	OpenTSDBInputs []opentsdb.Config `toml:"opentsdb"`
+	UDPInputs      []udp.Config      `toml:"udp"`
+	Replicator     replicator.Config `toml:"replicator"`
 
 	ContinuousQuery continuous_querier.Config `toml:"continuous_queries"`
 
@@ -81,8 +85,11 @@ func NewConfig() *Config {
 	c.Monitor = monitor.NewConfig()
 	c.Subscriber = subscriber.NewConfig()
 	c.HTTPD = httpd.NewConfig()
-	c.Collectd = collectd.NewConfig()
-	c.OpenTSDB = opentsdb.NewConfig()
+
+	c.GraphiteInputs = []graphite.Config{graphite.NewConfig()}
+	c.CollectdInputs = []collectd.Config{collectd.NewConfig()}
+	c.OpenTSDBInputs = []opentsdb.Config{opentsdb.NewConfig()}
+	c.UDPInputs = []udp.Config{udp.NewConfig()}
 
 	c.Replicator = replicator.NewConfig()
 
@@ -90,30 +97,12 @@ func NewConfig() *Config {
 	c.Retention = retention.NewConfig()
 	c.BindAddress = DefaultBindAddress
 
-	// All ARRAY attributes have to be init after toml decode
-	// See: https://github.com/BurntSushi/toml/pull/68
-	// Those attributes will be initialized in Config.InitTableAttrs method
-	// Concerned Attributes:
-	//  * `c.Graphites`
-	//  * `c.UDPs`
-
 	return c
-}
-
-// InitTableAttrs initialises all ARRAY attributes if empty
-func (c *Config) InitTableAttrs() {
-	if len(c.UDPs) == 0 {
-		c.UDPs = []udp.Config{udp.NewConfig()}
-	}
-	if len(c.Graphites) == 0 {
-		c.Graphites = []graphite.Config{graphite.NewConfig()}
-	}
 }
 
 // NewDemoConfig returns the config that runs when no config is specified.
 func NewDemoConfig() (*Config, error) {
 	c := NewConfig()
-	c.InitTableAttrs()
 
 	var homeDir string
 	// By default, store meta and data files in current users home directory
@@ -135,6 +124,30 @@ func NewDemoConfig() (*Config, error) {
 	return c, nil
 }
 
+// FromTomlFile loads the config from a TOML file.
+func (c *Config) FromTomlFile(fpath string) error {
+	bs, err := ioutil.ReadFile(fpath)
+	if err != nil {
+		return err
+	}
+	return c.FromToml(string(bs))
+}
+
+// FromToml loads the config from TOML.
+func (c *Config) FromToml(input string) error {
+	// Replace collectd and opentsdb sections in the old format with the new.
+	// TODO(jsternberg): Remove for 1.0.
+	re := regexp.MustCompile(`(?m)^\s*\[(collectd|opentsdb)\]`)
+	input = re.ReplaceAllStringFunc(input, func(in string) string {
+		in = strings.TrimSpace(in)
+		out := "[" + in + "]"
+		log.Printf("deprecated config option %s replaced with %s; %s will not be supported in a future release\n", in, out, in)
+		return out
+	})
+	_, err := toml.Decode(input, c)
+	return err
+}
+
 // Validate returns an error if the config is invalid.
 func (c *Config) Validate() error {
 	if err := c.Meta.Validate(); err != nil {
@@ -145,7 +158,7 @@ func (c *Config) Validate() error {
 		return err
 	}
 
-	for _, g := range c.Graphites {
+	for _, g := range c.GraphiteInputs {
 		if err := g.Validate(); err != nil {
 			return fmt.Errorf("invalid graphite config: %v", err)
 		}
@@ -194,6 +207,9 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 			// e.g. GRAPHITE_0
 			if f.Kind() == reflect.Slice || f.Kind() == reflect.Array {
 				for i := 0; i < f.Len(); i++ {
+					if err := c.applyEnvOverrides(key, f.Index(i)); err != nil {
+						return err
+					}
 					if err := c.applyEnvOverrides(fmt.Sprintf("%s_%d", key, i), f.Index(i)); err != nil {
 						return err
 					}
@@ -237,6 +253,15 @@ func (c *Config) applyEnvOverrides(prefix string, spec reflect.Value) error {
 				}
 
 				f.SetInt(intValue)
+			case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				var intValue uint64
+				var err error
+				intValue, err = strconv.ParseUint(value, 0, f.Type().Bits())
+				if err != nil {
+					return fmt.Errorf("failed to apply %v to %v using type %v and value '%v'", key, fieldKey, f.Type().String(), value)
+				}
+
+				f.SetUint(intValue)
 			case reflect.Bool:
 				boolValue, err := strconv.ParseBool(value)
 				if err != nil {

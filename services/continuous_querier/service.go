@@ -4,6 +4,7 @@ import (
 	"errors"
 	"expvar"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"strings"
@@ -38,8 +39,8 @@ type ContinuousQuerier interface {
 // metaClient is an internal interface to make testing easier.
 type metaClient interface {
 	AcquireLease(name string) (l *meta.Lease, err error)
-	Databases() ([]meta.DatabaseInfo, error)
-	Database(name string) (*meta.DatabaseInfo, error)
+	Databases() []meta.DatabaseInfo
+	Database(name string) *meta.DatabaseInfo
 }
 
 // RunRequest is a request to run one or more CQs.
@@ -67,7 +68,7 @@ func (rr *RunRequest) matches(cq *meta.ContinuousQueryInfo) bool {
 // Service manages continuous query execution.
 type Service struct {
 	MetaClient    metaClient
-	QueryExecutor influxql.QueryExecutor
+	QueryExecutor *influxql.QueryExecutor
 	Config        *Config
 	RunInterval   time.Duration
 	// RunCh can be used by clients to signal service to run CQs.
@@ -127,9 +128,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[continuous_querier] ", log.LstdFlags)
 }
 
 // Run runs the specified continuous query, or all CQs if none is specified.
@@ -138,20 +140,14 @@ func (s *Service) Run(database, name string, t time.Time) error {
 
 	if database != "" {
 		// Find the requested database.
-		db, err := s.MetaClient.Database(database)
-		if err != nil {
-			return err
-		} else if db == nil {
+		db := s.MetaClient.Database(database)
+		if db == nil {
 			return influxql.ErrDatabaseNotFound(database)
 		}
 		dbs = append(dbs, *db)
 	} else {
 		// Get all databases.
-		var err error
-		dbs, err = s.MetaClient.Databases()
-		if err != nil {
-			return err
-		}
+		dbs = s.MetaClient.Databases()
 	}
 
 	// Loop through databases.
@@ -207,11 +203,7 @@ func (s *Service) backgroundLoop() {
 // hasContinuousQueries returns true if any CQs exist.
 func (s *Service) hasContinuousQueries() bool {
 	// Get list of all databases.
-	dbs, err := s.MetaClient.Databases()
-	if err != nil {
-		s.Logger.Println("error getting databases")
-		return false
-	}
+	dbs := s.MetaClient.Databases()
 	// Loop through all databases executing CQs.
 	for _, db := range dbs {
 		if len(db.ContinuousQueries) > 0 {
@@ -224,11 +216,7 @@ func (s *Service) hasContinuousQueries() bool {
 // runContinuousQueries gets CQs from the meta store and runs them.
 func (s *Service) runContinuousQueries(req *RunRequest) {
 	// Get list of all databases.
-	dbs, err := s.MetaClient.Databases()
-	if err != nil {
-		s.Logger.Println("error getting databases")
-		return
-	}
+	dbs := s.MetaClient.Databases()
 	// Loop through all databases executing CQs.
 	for _, db := range dbs {
 		// TODO: distribute across nodes
@@ -346,7 +334,7 @@ func (s *Service) runContinuousQueryAndWriteResult(cq *ContinuousQuery) error {
 	defer close(closing)
 
 	// Execute the SELECT.
-	ch := s.QueryExecutor.ExecuteQuery(q, cq.Database, NoChunkingSize, closing)
+	ch := s.QueryExecutor.ExecuteQuery(q, cq.Database, NoChunkingSize, false, closing)
 
 	// There is only one statement, so we will only ever receive one result
 	res, ok := <-ch

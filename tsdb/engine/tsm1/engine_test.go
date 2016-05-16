@@ -3,10 +3,13 @@ package tsm1_test
 import (
 	"archive/tar"
 	"bytes"
+	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -34,7 +37,7 @@ func TestEngine_LoadMetadataIndex(t *testing.T) {
 
 	// Load metadata index.
 	index := tsdb.NewDatabaseIndex("db")
-	if err := e.LoadMetadataIndex(nil, index); err != nil {
+	if err := e.LoadMetadataIndex(1, index); err != nil {
 		t.Fatal(err)
 	}
 
@@ -57,7 +60,7 @@ func TestEngine_LoadMetadataIndex(t *testing.T) {
 
 	// Load metadata index.
 	index = tsdb.NewDatabaseIndex("db")
-	if err := e.LoadMetadataIndex(nil, index); err != nil {
+	if err := e.LoadMetadataIndex(1, index); err != nil {
 		t.Fatal(err)
 	}
 
@@ -82,7 +85,7 @@ func TestEngine_LoadMetadataIndex(t *testing.T) {
 
 	// Load metadata index.
 	index = tsdb.NewDatabaseIndex("db")
-	if err := e.LoadMetadataIndex(nil, index); err != nil {
+	if err := e.LoadMetadataIndex(1, index); err != nil {
 		t.Fatal(err)
 	}
 
@@ -241,16 +244,24 @@ func TestEngine_CreateIterator_Cache_Ascending(t *testing.T) {
 	}
 	fitr := itr.(influxql.FloatIterator)
 
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
 		t.Fatalf("unexpected point(0): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(1): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
 		t.Fatalf("unexpected point(1): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
 		t.Fatalf("unexpected point(2): %v", p)
 	}
-	if p := fitr.Next(); p != nil {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("expected eof, got error: %v", err)
+	} else if p != nil {
 		t.Fatalf("expected eof: %v", p)
 	}
 }
@@ -286,16 +297,24 @@ func TestEngine_CreateIterator_Cache_Descending(t *testing.T) {
 	}
 	fitr := itr.(influxql.FloatIterator)
 
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
 		t.Fatalf("unexpected point(0): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unepxected error(1): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
 		t.Fatalf("unexpected point(1): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
 		t.Fatalf("unexpected point(2): %v", p)
 	}
-	if p := fitr.Next(); p != nil {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("expected eof, got error: %v", err)
+	} else if p != nil {
 		t.Fatalf("expected eof: %v", p)
 	}
 }
@@ -332,16 +351,24 @@ func TestEngine_CreateIterator_TSM_Ascending(t *testing.T) {
 	}
 	fitr := itr.(influxql.FloatIterator)
 
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
 		t.Fatalf("unexpected point(0): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(1): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
 		t.Fatalf("unexpected point(1): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
 		t.Fatalf("unexpected point(2): %v", p)
 	}
-	if p := fitr.Next(); p != nil {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("expected eof, got error: %v", err)
+	} else if p != nil {
 		t.Fatalf("expected eof: %v", p)
 	}
 }
@@ -378,16 +405,24 @@ func TestEngine_CreateIterator_TSM_Descending(t *testing.T) {
 	}
 	fitr := itr.(influxql.FloatIterator)
 
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
 		t.Fatalf("unexpected point(0): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(1): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2}) {
 		t.Fatalf("unexpected point(1): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
 		t.Fatalf("unexpected point(2): %v", p)
 	}
-	if p := fitr.Next(); p != nil {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("expected eof, got error: %v", err)
+	} else if p != nil {
 		t.Fatalf("expected eof: %v", p)
 	}
 }
@@ -427,16 +462,24 @@ func TestEngine_CreateIterator_Aux(t *testing.T) {
 	}
 	fitr := itr.(influxql.FloatIterator)
 
-	if p := fitr.Next(); !deep.Equal(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1, Aux: []interface{}{float64(100)}}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %v", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1, Aux: []interface{}{float64(100)}}) {
 		t.Fatalf("unexpected point(0): %v", p)
 	}
-	if p := fitr.Next(); !deep.Equal(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2, Aux: []interface{}{(*float64)(nil)}}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(1): %v", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 2000000000, Value: 1.2, Aux: []interface{}{(*float64)(nil)}}) {
 		t.Fatalf("unexpected point(1): %v", p)
 	}
-	if p := fitr.Next(); !deep.Equal(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3, Aux: []interface{}{float64(200)}}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(2): %v", err)
+	} else if !deep.Equal(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3, Aux: []interface{}{float64(200)}}) {
 		t.Fatalf("unexpected point(2): %v", p)
 	}
-	if p := fitr.Next(); p != nil {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("expected eof, got error: %v", err)
+	} else if p != nil {
 		t.Fatalf("expected eof: %v", p)
 	}
 }
@@ -483,15 +526,144 @@ func TestEngine_CreateIterator_Condition(t *testing.T) {
 	}
 	fitr := itr.(influxql.FloatIterator)
 
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected error(0): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 1000000000, Value: 1.1}) {
 		t.Fatalf("unexpected point(0): %v", p)
 	}
-	if p := fitr.Next(); !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
-		t.Fatalf("unexpected point(2): %v", p)
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("unexpected point(1): %v", err)
+	} else if !reflect.DeepEqual(p, &influxql.FloatPoint{Name: "cpu", Tags: ParseTags("host=A"), Time: 3000000000, Value: 1.3}) {
+		t.Fatalf("unexpected point(1): %v", p)
 	}
-	if p := fitr.Next(); p != nil {
+	if p, err := fitr.Next(); err != nil {
+		t.Fatalf("expected eof, got error: %v", err)
+	} else if p != nil {
 		t.Fatalf("expected eof: %v", p)
 	}
+}
+
+func BenchmarkEngine_CreateIterator_Count_1K(b *testing.B) {
+	benchmarkEngineCreateIteratorCount(b, 1000)
+}
+func BenchmarkEngine_CreateIterator_Count_100K(b *testing.B) {
+	benchmarkEngineCreateIteratorCount(b, 100000)
+}
+func BenchmarkEngine_CreateIterator_Count_1M(b *testing.B) {
+	benchmarkEngineCreateIteratorCount(b, 1000000)
+}
+
+func benchmarkEngineCreateIteratorCount(b *testing.B, pointN int) {
+	benchmarkIterator(b, influxql.IteratorOptions{
+		Expr:      influxql.MustParseExpr("count(value)"),
+		Sources:   []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+		Ascending: true,
+		StartTime: influxql.MinTime,
+		EndTime:   influxql.MaxTime,
+	}, pointN)
+}
+
+func BenchmarkEngine_CreateIterator_Limit_1K(b *testing.B) {
+	benchmarkEngineCreateIteratorLimit(b, 1000)
+}
+func BenchmarkEngine_CreateIterator_Limit_100K(b *testing.B) {
+	benchmarkEngineCreateIteratorLimit(b, 100000)
+}
+func BenchmarkEngine_CreateIterator_Limit_1M(b *testing.B) {
+	benchmarkEngineCreateIteratorLimit(b, 1000000)
+}
+
+func benchmarkEngineCreateIteratorLimit(b *testing.B, pointN int) {
+	benchmarkIterator(b, influxql.IteratorOptions{
+		Expr:       influxql.MustParseExpr("value"),
+		Sources:    []influxql.Source{&influxql.Measurement{Name: "cpu"}},
+		Dimensions: []string{"host"},
+		Ascending:  true,
+		StartTime:  influxql.MinTime,
+		EndTime:    influxql.MaxTime,
+		Limit:      10,
+	}, pointN)
+}
+
+func benchmarkIterator(b *testing.B, opt influxql.IteratorOptions, pointN int) {
+	e := MustInitBenchmarkEngine(pointN)
+	b.ResetTimer()
+	b.ReportAllocs()
+
+	for i := 0; i < b.N; i++ {
+		itr, err := e.CreateIterator(opt)
+		if err != nil {
+			b.Fatal(err)
+		}
+		influxql.DrainIterator(itr)
+	}
+}
+
+var benchmark struct {
+	Engine *Engine
+	PointN int
+}
+
+var hostNames = []string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J"}
+
+// MustInitBenchmarkEngine creates a new engine and fills it with points.
+// Reuses previous engine if the same parameters were used.
+func MustInitBenchmarkEngine(pointN int) *Engine {
+	// Reuse engine, if available.
+	if benchmark.Engine != nil {
+		if benchmark.PointN == pointN {
+			return benchmark.Engine
+		}
+
+		// Otherwise close and remove it.
+		benchmark.Engine.Close()
+		benchmark.Engine = nil
+	}
+
+	const batchSize = 1000
+	if pointN%batchSize != 0 {
+		panic(fmt.Sprintf("point count (%d) must be a multiple of batch size (%d)", pointN, batchSize))
+	}
+
+	e := MustOpenEngine()
+
+	// Initialize metadata.
+	e.Index().CreateMeasurementIndexIfNotExists("cpu")
+	e.MeasurementFields("cpu").CreateFieldIfNotExists("value", influxql.Float, false)
+	e.Index().CreateSeriesIndexIfNotExists("cpu", tsdb.NewSeries("cpu,host=A", map[string]string{"host": "A"}))
+
+	// Generate time ascending points with jitterred time & value.
+	rand := rand.New(rand.NewSource(0))
+	for i := 0; i < pointN; i += batchSize {
+		var buf bytes.Buffer
+		for j := 0; j < batchSize; j++ {
+			fmt.Fprintf(&buf, "cpu,host=%s value=%d %d",
+				hostNames[j%len(hostNames)],
+				100+rand.Intn(50)-25,
+				(time.Duration(i+j)*time.Second)+(time.Duration(rand.Intn(500)-250)*time.Millisecond),
+			)
+			if j != pointN-1 {
+				fmt.Fprint(&buf, "\n")
+			}
+		}
+
+		if err := e.WritePointsString(buf.String()); err != nil {
+			panic(err)
+		}
+	}
+
+	if err := e.WriteSnapshot(); err != nil {
+		panic(err)
+	}
+
+	// Force garbage collection.
+	runtime.GC()
+
+	// Save engine reference for reuse.
+	benchmark.Engine = e
+	benchmark.PointN = pointN
+
+	return e
 }
 
 // Engine is a test wrapper for tsm1.Engine.
@@ -521,7 +693,7 @@ func MustOpenEngine() *Engine {
 	if err := e.Open(); err != nil {
 		panic(err)
 	}
-	if err := e.LoadMetadataIndex(nil, tsdb.NewDatabaseIndex("db")); err != nil {
+	if err := e.LoadMetadataIndex(1, tsdb.NewDatabaseIndex("db")); err != nil {
 		panic(err)
 	}
 	return e

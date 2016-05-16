@@ -3,6 +3,7 @@ package cluster
 import (
 	"errors"
 	"expvar"
+	"io"
 	"log"
 	"os"
 	"sync"
@@ -51,7 +52,7 @@ type PointsWriter struct {
 	Node *influxdb.Node
 
 	MetaClient interface {
-		Database(name string) (di *meta.DatabaseInfo, err error)
+		Database(name string) (di *meta.DatabaseInfo)
 		RetentionPolicy(database, policy string) (*meta.RetentionPolicyInfo, error)
 		CreateShardGroup(database, policy string, timestamp time.Time) (*meta.ShardGroupInfo, error)
 		ShardOwner(shardID uint64) (string, string, *meta.ShardGroupInfo)
@@ -151,6 +152,12 @@ func (w *PointsWriter) Close() error {
 	return nil
 }
 
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (w *PointsWriter) SetLogOutput(lw io.Writer) {
+	w.Logger = log.New(lw, "[write] ", log.LstdFlags)
+}
+
 // MapShards maps the points contained in wp to a ShardMapping.  If a point
 // maps to a shard group or shard that does not currently exist, it will be
 // created before returning the mapping.
@@ -201,10 +208,8 @@ func (w *PointsWriter) WritePoints(database, retentionPolicy string, consistency
 	w.statMap.Add(statPointWriteReq, int64(len(points)))
 
 	if retentionPolicy == "" {
-		db, err := w.MetaClient.Database(database)
-		if err != nil {
-			return err
-		} else if db == nil {
+		db := w.MetaClient.Database(database)
+		if db == nil {
 			return influxdb.ErrDatabaseNotFound(database)
 		}
 		retentionPolicy = db.DefaultRetentionPolicy

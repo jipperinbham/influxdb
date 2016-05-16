@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,8 +38,9 @@ type Engine struct {
 	done chan struct{}
 	wg   sync.WaitGroup
 
-	path   string
-	logger *log.Logger
+	path      string
+	logger    *log.Logger
+	logOutput io.Writer
 
 	// TODO(benbjohnson): Index needs to be moved entirely into engine.
 	index             *tsdb.DatabaseIndex
@@ -79,7 +81,6 @@ func NewEngine(path string, walPath string, opt tsdb.EngineOptions) tsdb.Engine 
 
 	e := &Engine{
 		path:              path,
-		logger:            log.New(os.Stderr, "[tsm1] ", log.LstdFlags),
 		measurementFields: make(map[string]*tsdb.MeasurementFields),
 
 		WAL:   w,
@@ -96,6 +97,7 @@ func NewEngine(path string, walPath string, opt tsdb.EngineOptions) tsdb.Engine 
 		CacheFlushMemorySizeThreshold: opt.Config.CacheSnapshotMemorySize,
 		CacheFlushWriteColdDuration:   time.Duration(opt.Config.CacheSnapshotWriteColdDuration),
 	}
+	e.SetLogOutput(os.Stderr)
 
 	return e
 }
@@ -194,15 +196,19 @@ func (e *Engine) Close() error {
 	return e.WAL.Close()
 }
 
-// SetLogOutput is a no-op.
-func (e *Engine) SetLogOutput(w io.Writer) {}
+// SetLogOutput sets the logger used for all messages. It must not be called
+// after the Open method has been called.
+func (e *Engine) SetLogOutput(w io.Writer) {
+	e.logger = log.New(w, "[tsm1] ", log.LstdFlags)
+	e.WAL.SetLogOutput(w)
+	e.FileStore.SetLogOutput(w)
+	e.logOutput = w
+}
 
 // LoadMetadataIndex loads the shard metadata into memory.
-func (e *Engine) LoadMetadataIndex(sh *tsdb.Shard, index *tsdb.DatabaseIndex) error {
+func (e *Engine) LoadMetadataIndex(shardID uint64, index *tsdb.DatabaseIndex) error {
 	// Save reference to index for iterator creation.
 	e.index = index
-
-	start := time.Now()
 
 	if err := e.FileStore.WalkKeys(func(key string, typ byte) error {
 		fieldType, err := tsmFieldTypeToInfluxQLDataType(typ)
@@ -210,7 +216,7 @@ func (e *Engine) LoadMetadataIndex(sh *tsdb.Shard, index *tsdb.DatabaseIndex) er
 			return err
 		}
 
-		if err := e.addToIndexFromKey(key, fieldType, index); err != nil {
+		if err := e.addToIndexFromKey(shardID, key, fieldType, index); err != nil {
 			return err
 		}
 		return nil
@@ -230,15 +236,11 @@ func (e *Engine) LoadMetadataIndex(sh *tsdb.Shard, index *tsdb.DatabaseIndex) er
 			continue
 		}
 
-		if err := e.addToIndexFromKey(key, fieldType, index); err != nil {
+		if err := e.addToIndexFromKey(shardID, key, fieldType, index); err != nil {
 			return err
 		}
 	}
 
-	// sh may be nil in tests
-	if sh != nil {
-		e.logger.Printf("%s database index loaded in %s", sh.Path(), time.Now().Sub(start))
-	}
 	return nil
 }
 
@@ -307,7 +309,7 @@ func (e *Engine) writeFileToBackup(f FileStat, shardRelativePath string, tw *tar
 
 // addToIndexFromKey will pull the measurement name, series key, and field name from a composite key and add it to the
 // database index and measurement fields
-func (e *Engine) addToIndexFromKey(key string, fieldType influxql.DataType, index *tsdb.DatabaseIndex) error {
+func (e *Engine) addToIndexFromKey(shardID uint64, key string, fieldType influxql.DataType, index *tsdb.DatabaseIndex) error {
 	seriesKey, field := seriesAndFieldFromCompositeKey(key)
 	measurement := tsdb.MeasurementFromSeriesKey(seriesKey)
 
@@ -324,14 +326,14 @@ func (e *Engine) addToIndexFromKey(key string, fieldType influxql.DataType, inde
 		return err
 	}
 
-	_, tags, err := models.ParseKey(seriesKey)
-	if err == nil {
-		return err
-	}
+	// ignore error because ParseKey returns "missing fields" and we don't have
+	// fields (in line protocol format) in the series key
+	_, tags, _ := models.ParseKey(seriesKey)
 
 	s := tsdb.NewSeries(seriesKey, tags)
 	s.InitializeShards()
 	index.CreateSeriesIndexIfNotExists(measurement, s)
+	s.AssignShard(shardID)
 
 	return nil
 }
@@ -360,8 +362,44 @@ func (e *Engine) WritePoints(points []models.Point) error {
 	return err
 }
 
-// DeleteSeries deletes the series from the engine.
+// ContainsSeries returns a map of keys indicating whether the key exists and
+// has values or not.
+func (e *Engine) ContainsSeries(keys []string) (map[string]bool, error) {
+	// keyMap is used to see if a given key exists.  keys
+	// are the measurement + tagset (minus separate & field)
+	keyMap := map[string]bool{}
+	for _, k := range keys {
+		keyMap[k] = false
+	}
+
+	for _, k := range e.Cache.Keys() {
+		seriesKey, _ := seriesAndFieldFromCompositeKey(k)
+		keyMap[seriesKey] = true
+	}
+
+	if err := e.FileStore.WalkKeys(func(k string, _ byte) error {
+		seriesKey, _ := seriesAndFieldFromCompositeKey(k)
+		if _, ok := keyMap[seriesKey]; ok {
+			keyMap[seriesKey] = true
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return keyMap, nil
+}
+
+// DeleteSeries removes all series keys from the engine.
 func (e *Engine) DeleteSeries(seriesKeys []string) error {
+	return e.DeleteSeriesRange(seriesKeys, math.MinInt64, math.MaxInt64)
+}
+
+// DeleteSeriesRange removes the values between min and max (inclusive) from all series.
+func (e *Engine) DeleteSeriesRange(seriesKeys []string, min, max int64) error {
+	if len(seriesKeys) == 0 {
+		return nil
+	}
+
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 
@@ -374,13 +412,17 @@ func (e *Engine) DeleteSeries(seriesKeys []string) error {
 
 	var deleteKeys []string
 	// go through the keys in the file store
-	for k := range e.FileStore.Keys() {
+	if err := e.FileStore.WalkKeys(func(k string, _ byte) error {
 		seriesKey, _ := seriesAndFieldFromCompositeKey(k)
 		if _, ok := keyMap[seriesKey]; ok {
 			deleteKeys = append(deleteKeys, k)
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
-	if err := e.FileStore.Delete(deleteKeys); err != nil {
+
+	if err := e.FileStore.DeleteRange(deleteKeys, min, max); err != nil {
 		return err
 	}
 
@@ -396,10 +438,11 @@ func (e *Engine) DeleteSeries(seriesKeys []string) error {
 	}
 	e.Cache.RUnlock()
 
-	e.Cache.Delete(walKeys)
+	e.Cache.DeleteRange(walKeys, min, max)
 
 	// delete from the WAL
-	_, err := e.WAL.Delete(walKeys)
+	_, err := e.WAL.DeleteRange(walKeys, min, max)
+
 	return err
 }
 
@@ -659,7 +702,16 @@ func (e *Engine) reloadCache() error {
 		return err
 	}
 
+	limit := e.Cache.MaxSize()
+	defer func() {
+		e.Cache.SetMaxSize(limit)
+	}()
+
+	// Disable the max size during loading
+	e.Cache.SetMaxSize(0)
+
 	loader := NewCacheLoader(files)
+	loader.SetLogOutput(e.logOutput)
 	if err := loader.Load(e.Cache); err != nil {
 		return err
 	}
@@ -697,18 +749,22 @@ func (e *Engine) CreateIterator(opt influxql.IteratorOptions) (influxql.Iterator
 		}
 
 		input := influxql.NewMergeIterator(inputs, opt)
-		if opt.InterruptCh != nil {
-			input = influxql.NewInterruptIterator(input, opt.InterruptCh)
+		if input != nil {
+			if opt.InterruptCh != nil {
+				input = influxql.NewInterruptIterator(input, opt.InterruptCh)
+			}
+			return influxql.NewCallIterator(input, opt)
 		}
-		return influxql.NewCallIterator(input, opt)
+		return nil, nil
 	}
 
 	itrs, err := e.createVarRefIterator(opt)
 	if err != nil {
 		return nil, err
 	}
+
 	itr := influxql.NewSortedMergeIterator(itrs, opt)
-	if opt.InterruptCh != nil {
+	if itr != nil && opt.InterruptCh != nil {
 		itr = influxql.NewInterruptIterator(itr, opt.InterruptCh)
 	}
 	return itr, nil
@@ -727,18 +783,9 @@ func (e *Engine) SeriesKeys(opt influxql.IteratorOptions) (influxql.SeriesList, 
 		// Calculate tag sets and apply SLIMIT/SOFFSET.
 		tagSets = influxql.LimitTagSets(tagSets, opt.SLimit, opt.SOffset)
 		for _, t := range tagSets {
-			tagMap := make(map[string]string)
-			for k, v := range t.Tags {
-				if v == "" {
-					continue
-				}
-				tagMap[k] = v
-			}
-			tags := influxql.NewTags(tagMap)
-
 			series := influxql.Series{
 				Name: mm.Name,
-				Tags: tags,
+				Tags: influxql.NewTags(t.Tags),
 				Aux:  make([]influxql.DataType, len(opt.Aux)),
 			}
 
@@ -801,25 +848,36 @@ func (e *Engine) createVarRefIterator(opt influxql.IteratorOptions) ([]influxql.
 			tagSets = influxql.LimitTagSets(tagSets, opt.SLimit, opt.SOffset)
 
 			for _, t := range tagSets {
+				inputs := make([]influxql.Iterator, 0, len(t.SeriesKeys))
 				for i, seriesKey := range t.SeriesKeys {
 					fields := 0
 					if t.Filters[i] != nil {
 						// Retrieve non-time fields from this series filter and filter out tags.
 						for _, f := range influxql.ExprNames(t.Filters[i]) {
-							if mm.HasField(f) {
-								conditionFields[fields] = f
-								fields++
-							}
+							conditionFields[fields] = f
+							fields++
 						}
 					}
 
-					itr, err := e.createVarRefSeriesIterator(ref, mm, seriesKey, t, t.Filters[i], conditionFields[:fields], opt)
+					input, err := e.createVarRefSeriesIterator(ref, mm, seriesKey, t, t.Filters[i], conditionFields[:fields], opt)
 					if err != nil {
 						return err
-					} else if itr == nil {
+					} else if input == nil {
 						continue
 					}
-					itrs = append(itrs, itr)
+					inputs = append(inputs, input)
+				}
+
+				if len(inputs) > 0 && (opt.Limit > 0 || opt.Offset > 0) {
+					var itr influxql.Iterator
+					if opt.MergeSorted() {
+						itr = influxql.NewSortedMergeIterator(inputs, opt)
+					} else {
+						itr = influxql.NewMergeIterator(inputs, opt)
+					}
+					itrs = append(itrs, newLimitIterator(itr, opt))
+				} else {
+					itrs = append(itrs, inputs...)
 				}
 			}
 		}
@@ -865,15 +923,23 @@ func (e *Engine) createVarRefSeriesIterator(ref *influxql.VarRef, mm *tsdb.Measu
 
 	// Build conditional field cursors.
 	// If a conditional field doesn't exist then ignore the series.
-	var conds []*bufCursor
+	var conds []cursorAt
 	if len(conditionFields) > 0 {
-		conds = make([]*bufCursor, len(conditionFields))
+		conds = make([]cursorAt, len(conditionFields))
 		for i := range conds {
 			cur := e.buildCursor(mm.Name, seriesKey, conditionFields[i], opt)
-			if cur == nil {
-				return nil, nil
+			if cur != nil {
+				conds[i] = newBufCursor(cur, opt.Ascending)
+				continue
 			}
-			conds[i] = newBufCursor(cur, opt.Ascending)
+
+			// If field doesn't exist, use the tag value.
+			// However, if the tag value is blank then return a null.
+			if v := tags.Value(conditionFields[i]); v == "" {
+				conds[i] = &stringNilLiteralCursor{}
+			} else {
+				conds[i] = &stringLiteralCursor{value: v}
+			}
 		}
 	}
 

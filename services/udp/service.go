@@ -3,6 +3,7 @@ package udp // import "github.com/influxdata/influxdb/services/udp"
 import (
 	"errors"
 	"expvar"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -19,6 +20,8 @@ import (
 const (
 	// Arbitrary, testing indicated that this doesn't typically get over 10
 	parserChanLen = 1000
+
+	MAX_UDP_PAYLOAD = 64 * 1024
 )
 
 // statistics gathered by the UDP package.
@@ -144,6 +147,7 @@ func (s *Service) writer() {
 func (s *Service) serve() {
 	defer s.wg.Done()
 
+	buf := make([]byte, MAX_UDP_PAYLOAD)
 	s.batcher.Start()
 	for {
 
@@ -153,7 +157,6 @@ func (s *Service) serve() {
 			return
 		default:
 			// Keep processing.
-			buf := make([]byte, s.config.UDPPayloadSize)
 			n, _, err := s.conn.ReadFromUDP(buf)
 			if err != nil {
 				s.statMap.Add(statReadFail, 1)
@@ -161,7 +164,10 @@ func (s *Service) serve() {
 				continue
 			}
 			s.statMap.Add(statBytesReceived, int64(n))
-			s.parserChan <- buf[:n]
+
+			bufCopy := make([]byte, n)
+			copy(bufCopy, buf[:n])
+			s.parserChan <- bufCopy
 		}
 	}
 }
@@ -209,9 +215,10 @@ func (s *Service) Close() error {
 	return nil
 }
 
-// SetLogger sets the internal logger to the logger passed in.
-func (s *Service) SetLogger(l *log.Logger) {
-	s.Logger = l
+// SetLogOutput sets the writer to which all logs are written. It must not be
+// called after Open is called.
+func (s *Service) SetLogOutput(w io.Writer) {
+	s.Logger = log.New(w, "[udp] ", log.LstdFlags)
 }
 
 // Addr returns the listener's address

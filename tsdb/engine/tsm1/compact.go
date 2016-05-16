@@ -453,10 +453,7 @@ func (c *Compactor) compact(fast bool, tsmFiles []string) ([]string, error) {
 			return nil, err
 		}
 
-		tr, err := NewTSMReaderWithOptions(
-			TSMReaderOptions{
-				MMAPFile: f,
-			})
+		tr, err := NewTSMReader(f)
 		if err != nil {
 			return nil, err
 		}
@@ -649,6 +646,7 @@ type block struct {
 	key              string
 	minTime, maxTime int64
 	b                []byte
+	tombstones       []TimeRange
 }
 
 type blocks []*block
@@ -674,7 +672,6 @@ func NewTSMKeyIterator(size int, fast bool, readers ...*TSMReader) (KeyIterator,
 		readers:   readers,
 		values:    map[string][]Value{},
 		pos:       make([]int, len(readers)),
-		keys:      make([]string, len(readers)),
 		size:      size,
 		iterators: iter,
 		fast:      fast,
@@ -697,31 +694,41 @@ func (k *tsmKeyIterator) Next() bool {
 		if v == nil {
 			iter := k.iterators[i]
 			if iter.Next() {
-				key, minTime, maxTime, b, err := iter.Read()
+				key, minTime, maxTime, _, b, err := iter.Read()
 				if err != nil {
 					k.err = err
 				}
 
+				// This block may have ranges of time removed from it that would
+				// reduce the block min and max time.
+				tombstones := iter.r.TombstoneRange(key)
+				minTime, maxTime = k.clampTombstoneRange(tombstones, minTime, maxTime)
+
 				k.buf[i] = append(k.buf[i], &block{
-					minTime: minTime,
-					maxTime: maxTime,
-					key:     key,
-					b:       b,
+					minTime:    minTime,
+					maxTime:    maxTime,
+					key:        key,
+					b:          b,
+					tombstones: tombstones,
 				})
 
 				blockKey := key
 				for iter.PeekNext() == blockKey {
 					iter.Next()
-					key, minTime, maxTime, b, err := iter.Read()
+					key, minTime, maxTime, _, b, err := iter.Read()
 					if err != nil {
 						k.err = err
 					}
 
+					tombstones := iter.r.TombstoneRange(key)
+					minTime, maxTime = k.clampTombstoneRange(tombstones, minTime, maxTime)
+
 					k.buf[i] = append(k.buf[i], &block{
-						minTime: minTime,
-						maxTime: maxTime,
-						key:     key,
-						b:       b,
+						minTime:    minTime,
+						maxTime:    maxTime,
+						key:        key,
+						b:          b,
+						tombstones: tombstones,
 					})
 				}
 			}
@@ -753,24 +760,32 @@ func (k *tsmKeyIterator) Next() bool {
 		}
 	}
 
-	// If we have more than one block, we many need to dedup
-	var dedup bool
+	// No blocks left, we're done
+	if len(k.blocks) == 0 {
+		return false
+	}
 
-	// Only one block, just return early everything after is wasted work
-	if len(k.blocks) == 1 {
+	// Only one block and no tombstoned values, just return early everything after is wasted work
+	if len(k.blocks) == 1 && len(k.blocks[0].tombstones) == 0 {
 		return true
 	}
 
+	// If we have more than one block or any partially tombstoned blocks, we many need to dedup
+	dedup := len(k.blocks[0].tombstones) > 0
+
 	if len(k.blocks) > 1 {
-		// Quickly scan each block to see if any overlap with the first block, if they overlap then
+		dedup = len(k.blocks[0].tombstones) > 0
+
+		// Quickly scan each block to see if any overlap with the prior block, if they overlap then
 		// we need to dedup as there may be duplicate points now
-		for i := 1; i < len(k.blocks); i++ {
-			if k.blocks[i].minTime <= k.blocks[i-1].maxTime {
+		for i := 1; !dedup && i < len(k.blocks); i++ {
+			if k.blocks[i].minTime <= k.blocks[i-1].maxTime || len(k.blocks[i].tombstones) > 0 {
 				dedup = true
 				break
 			}
 		}
 	}
+
 	k.blocks = k.combine(dedup)
 
 	return len(k.blocks) > 0
@@ -789,7 +804,13 @@ func (k *tsmKeyIterator) combine(dedup bool) blocks {
 				k.err = err
 				return nil
 			}
+
+			// Apply each tombstone to the block
+			for _, ts := range k.blocks[i].tombstones {
+				v = Values(v).Filter(ts.Min, ts.Max)
+			}
 			decoded = append(decoded, v...)
+
 		}
 		decoded = decoded.Deduplicate()
 
@@ -874,6 +895,18 @@ func (k *tsmKeyIterator) chunk(dst blocks, values []Value) blocks {
 		})
 	}
 	return dst
+}
+
+func (k *tsmKeyIterator) clampTombstoneRange(tombstones []TimeRange, minTime, maxTime int64) (int64, int64) {
+	for _, t := range tombstones {
+		if t.Min > minTime {
+			minTime = t.Min
+		}
+		if t.Max < maxTime {
+			maxTime = t.Max
+		}
+	}
+	return minTime, maxTime
 }
 
 func (k *tsmKeyIterator) Read() (string, int64, int64, []byte, error) {

@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/gogo/protobuf/proto"
-	"github.com/influxdata/influxdb/influxql/internal"
+	internal "github.com/influxdata/influxdb/influxql/internal"
 )
 
 // ErrUnknownCall is returned when operating on an unknown function call.
@@ -118,7 +118,7 @@ func (a Iterators) cast() interface{} {
 func NewMergeIterator(inputs []Iterator, opt IteratorOptions) Iterator {
 	inputs = Iterators(inputs).filterNonNil()
 	if len(inputs) == 0 {
-		return &nilFloatIterator{}
+		return nil
 	}
 
 	// Aggregate functions can use a more relaxed sorting so that points
@@ -145,7 +145,7 @@ func NewMergeIterator(inputs []Iterator, opt IteratorOptions) Iterator {
 func NewSortedMergeIterator(inputs []Iterator, opt IteratorOptions) Iterator {
 	inputs = Iterators(inputs).filterNonNil()
 	if len(inputs) == 0 {
-		return &nilFloatIterator{}
+		return nil
 	}
 
 	switch inputs := Iterators(inputs).cast().(type) {
@@ -395,53 +395,93 @@ func (a auxIteratorFields) send(p Point) (ok bool) {
 	return ok
 }
 
-// drainIterator reads all points from an iterator.
-func drainIterator(itr Iterator) {
+func (a auxIteratorFields) sendError(err error) {
+	for _, f := range a {
+		for _, itr := range f.itrs {
+			switch itr := itr.(type) {
+			case *floatChanIterator:
+				itr.setErr(err)
+			case *integerChanIterator:
+				itr.setErr(err)
+			case *stringChanIterator:
+				itr.setErr(err)
+			case *booleanChanIterator:
+				itr.setErr(err)
+			default:
+				panic(fmt.Sprintf("invalid aux itr type: %T", itr))
+			}
+		}
+	}
+}
+
+// DrainIterator reads all points from an iterator.
+func DrainIterator(itr Iterator) {
+	switch itr := itr.(type) {
+	case FloatIterator:
+		for p, _ := itr.Next(); p != nil; p, _ = itr.Next() {
+		}
+	case IntegerIterator:
+		for p, _ := itr.Next(); p != nil; p, _ = itr.Next() {
+		}
+	case StringIterator:
+		for p, _ := itr.Next(); p != nil; p, _ = itr.Next() {
+		}
+	case BooleanIterator:
+		for p, _ := itr.Next(); p != nil; p, _ = itr.Next() {
+		}
+	default:
+		panic(fmt.Sprintf("unsupported iterator type for draining: %T", itr))
+	}
+}
+
+// DrainIterators reads all points from all iterators.
+func DrainIterators(itrs []Iterator) {
 	for {
-		switch itr := itr.(type) {
-		case FloatIterator:
-			if p := itr.Next(); p == nil {
-				return
+		var hasData bool
+
+		for _, itr := range itrs {
+			switch itr := itr.(type) {
+			case FloatIterator:
+				if p, _ := itr.Next(); p != nil {
+					hasData = true
+				}
+			case IntegerIterator:
+				if p, _ := itr.Next(); p != nil {
+					hasData = true
+				}
+			case StringIterator:
+				if p, _ := itr.Next(); p != nil {
+					hasData = true
+				}
+			case BooleanIterator:
+				if p, _ := itr.Next(); p != nil {
+					hasData = true
+				}
+			default:
+				panic(fmt.Sprintf("unsupported iterator type for draining: %T", itr))
 			}
-		case IntegerIterator:
-			if p := itr.Next(); p == nil {
-				return
-			}
-		case StringIterator:
-			if p := itr.Next(); p == nil {
-				return
-			}
-		case BooleanIterator:
-			if p := itr.Next(); p == nil {
-				return
-			}
-		default:
-			panic(fmt.Sprintf("unsupported iterator type for draining: %T", itr))
+		}
+
+		// Exit once all iterators return a nil point.
+		if !hasData {
+			break
 		}
 	}
 }
 
 // NewReaderIterator returns an iterator that streams from a reader.
-func NewReaderIterator(r io.Reader) (Iterator, error) {
-	var p Point
-	dec := NewPointDecoder(r)
-	if err := dec.DecodePoint(&p); err == io.EOF {
-		return &nilFloatIterator{}, nil
-	} else if err != nil {
-		return nil, err
-	}
-
-	switch p := p.(type) {
-	case *FloatPoint:
-		return newFloatReaderIterator(r, p, dec.Stats()), nil
-	case *IntegerPoint:
-		return newIntegerReaderIterator(r, p, dec.Stats()), nil
-	case *StringPoint:
-		return newStringReaderIterator(r, p, dec.Stats()), nil
-	case *BooleanPoint:
-		return newBooleanReaderIterator(r, p, dec.Stats()), nil
+func NewReaderIterator(r io.Reader, typ DataType, stats IteratorStats) (Iterator, error) {
+	switch typ {
+	case Float:
+		return newFloatReaderIterator(r, stats), nil
+	case Integer:
+		return newIntegerReaderIterator(r, stats), nil
+	case String:
+		return newStringReaderIterator(r, stats), nil
+	case Boolean:
+		return newBooleanReaderIterator(r, stats), nil
 	default:
-		panic(fmt.Sprintf("unsupported point for reader iterator: %T", p))
+		return &nilFloatIterator{}, nil
 	}
 }
 
@@ -495,26 +535,29 @@ func (a IteratorCreators) CreateIterator(opt IteratorOptions) (Iterator, error) 
 	// Merge into a single iterator.
 	if opt.MergeSorted() {
 		itr := NewSortedMergeIterator(itrs, opt)
-		if opt.InterruptCh != nil {
+		if itr != nil && opt.InterruptCh != nil {
 			itr = NewInterruptIterator(itr, opt.InterruptCh)
 		}
 		return itr, nil
 	}
 
 	itr := NewMergeIterator(itrs, opt)
-	if opt.Expr != nil {
-		if expr, ok := opt.Expr.(*Call); ok && expr.Name == "count" {
-			opt.Expr = &Call{
-				Name: "sum",
-				Args: expr.Args,
+	if itr != nil {
+		if opt.Expr != nil {
+			if expr, ok := opt.Expr.(*Call); ok && expr.Name == "count" {
+				opt.Expr = &Call{
+					Name: "sum",
+					Args: expr.Args,
+				}
 			}
 		}
-	}
 
-	if opt.InterruptCh != nil {
-		itr = NewInterruptIterator(itr, opt.InterruptCh)
+		if opt.InterruptCh != nil {
+			itr = NewInterruptIterator(itr, opt.InterruptCh)
+		}
+		return NewCallIterator(itr, opt)
 	}
-	return NewCallIterator(itr, opt)
+	return nil, nil
 }
 
 // FieldDimensions returns unique fields and dimensions from multiple iterator creators.
@@ -681,6 +724,11 @@ func newIteratorOptionsStmt(stmt *SelectStatement, sopt *SelectOptions) (opt Ite
 	// Set duration to zero if a negative interval has been used.
 	if interval < 0 {
 		interval = 0
+	} else if interval > 0 {
+		opt.Interval.Offset, err = stmt.GroupByOffset(&opt)
+		if err != nil {
+			return opt, err
+		}
 	}
 	opt.Interval.Duration = interval
 
@@ -762,6 +810,16 @@ func (opt IteratorOptions) DerivativeInterval() Interval {
 	}
 
 	return Interval{Duration: time.Second}
+}
+
+// ElapsedInterval returns the time interval for the elapsed function.
+func (opt IteratorOptions) ElapsedInterval() Interval {
+	// Use the interval on the elapsed() call, if specified.
+	if expr, ok := opt.Expr.(*Call); ok && len(expr.Args) == 2 {
+		return Interval{Duration: expr.Args[1].(*DurationLiteral).Val}
+	}
+
+	return Interval{Duration: time.Nanosecond}
 }
 
 // MarshalBinary encodes opt into a binary format.
@@ -1033,9 +1091,9 @@ func decodeInterval(pb *internal.Interval) Interval {
 
 type nilFloatIterator struct{}
 
-func (*nilFloatIterator) Stats() IteratorStats { return IteratorStats{} }
-func (*nilFloatIterator) Close() error         { return nil }
-func (*nilFloatIterator) Next() *FloatPoint    { return nil }
+func (*nilFloatIterator) Stats() IteratorStats       { return IteratorStats{} }
+func (*nilFloatIterator) Close() error               { return nil }
+func (*nilFloatIterator) Next() (*FloatPoint, error) { return nil, nil }
 
 // integerFloatTransformIterator executes a function to modify an existing point for every
 // output of the input iterator.
@@ -1051,12 +1109,14 @@ func (itr *integerFloatTransformIterator) Stats() IteratorStats { return itr.inp
 func (itr *integerFloatTransformIterator) Close() error { return itr.input.Close() }
 
 // Next returns the minimum value for the next available interval.
-func (itr *integerFloatTransformIterator) Next() *FloatPoint {
-	p := itr.input.Next()
-	if p != nil {
-		return itr.fn(p)
+func (itr *integerFloatTransformIterator) Next() (*FloatPoint, error) {
+	p, err := itr.input.Next()
+	if err != nil {
+		return nil, err
+	} else if p != nil {
+		return itr.fn(p), nil
 	}
-	return nil
+	return nil, nil
 }
 
 // integerFloatTransformFunc creates or modifies a point.
@@ -1070,10 +1130,10 @@ type integerFloatCastIterator struct {
 
 func (itr *integerFloatCastIterator) Stats() IteratorStats { return itr.input.Stats() }
 func (itr *integerFloatCastIterator) Close() error         { return itr.input.Close() }
-func (itr *integerFloatCastIterator) Next() *FloatPoint {
-	p := itr.input.Next()
-	if p == nil {
-		return nil
+func (itr *integerFloatCastIterator) Next() (*FloatPoint, error) {
+	p, err := itr.input.Next()
+	if p == nil || err != nil {
+		return nil, err
 	}
 
 	return &FloatPoint{
@@ -1083,7 +1143,7 @@ func (itr *integerFloatCastIterator) Next() *FloatPoint {
 		Nil:   p.Nil,
 		Value: float64(p.Value),
 		Aux:   p.Aux,
-	}
+	}, nil
 }
 
 // IteratorStats represents statistics about an iterator.
@@ -1113,3 +1173,58 @@ func decodeIteratorStats(pb *internal.IteratorStats) IteratorStats {
 		PointN:  int(pb.GetPointN()),
 	}
 }
+
+// floatFastDedupeIterator outputs unique points where the point has a single aux field.
+type floatFastDedupeIterator struct {
+	input FloatIterator
+	m     map[fastDedupeKey]struct{} // lookup of points already sent
+}
+
+// newFloatFastDedupeIterator returns a new instance of floatFastDedupeIterator.
+func newFloatFastDedupeIterator(input FloatIterator) *floatFastDedupeIterator {
+	return &floatFastDedupeIterator{
+		input: input,
+		m:     make(map[fastDedupeKey]struct{}),
+	}
+}
+
+// Stats returns stats from the input iterator.
+func (itr *floatFastDedupeIterator) Stats() IteratorStats { return itr.input.Stats() }
+
+// Close closes the iterator and all child iterators.
+func (itr *floatFastDedupeIterator) Close() error { return itr.input.Close() }
+
+// Next returns the next unique point from the input iterator.
+func (itr *floatFastDedupeIterator) Next() (*FloatPoint, error) {
+	for {
+		// Read next point.
+		// Skip if there are not any aux fields.
+		p, err := itr.input.Next()
+		if p == nil || err != nil {
+			return nil, err
+		} else if len(p.Aux) == 0 {
+			continue
+		}
+
+		// If the point has already been output then move to the next point.
+		key := fastDedupeKey{p.Name, p.Aux[0]}
+		if _, ok := itr.m[key]; ok {
+			continue
+		}
+
+		// Otherwise mark it as emitted and return point.
+		itr.m[key] = struct{}{}
+		return p, nil
+	}
+}
+
+type fastDedupeKey struct {
+	name  string
+	value interface{}
+}
+
+type reverseStringSlice []string
+
+func (p reverseStringSlice) Len() int           { return len(p) }
+func (p reverseStringSlice) Less(i, j int) bool { return p[i] > p[j] }
+func (p reverseStringSlice) Swap(i, j int)      { p[i], p[j] = p[j], p[i] }

@@ -36,7 +36,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
-	"time"
 
 	"github.com/jwilder/encoding/simple8b"
 )
@@ -52,15 +51,8 @@ const (
 
 // TimeEncoder encodes time.Time to byte slices.
 type TimeEncoder interface {
-	Write(t time.Time)
+	Write(t int64)
 	Bytes() ([]byte, error)
-}
-
-// TimeDecoder decodes byte slices to time.Time values.
-type TimeDecoder interface {
-	Next() bool
-	Read() time.Time
-	Error() error
 }
 
 type encoder struct {
@@ -73,8 +65,8 @@ func NewTimeEncoder() TimeEncoder {
 }
 
 // Write adds a time.Time to the compressed stream.
-func (e *encoder) Write(t time.Time) {
-	e.ts = append(e.ts, uint64(t.UnixNano()))
+func (e *encoder) Write(t int64) {
+	e.ts = append(e.ts, uint64(t))
 }
 
 func (e *encoder) reduce() (max, divisor uint64, rle bool, deltas []uint64) {
@@ -191,36 +183,40 @@ func (e *encoder) encodeRLE(first, delta, div uint64, n int) ([]byte, error) {
 	return b[:i], nil
 }
 
-type decoder struct {
-	v   time.Time
+type TimeDecoder struct {
+	v   int64
+	i   int
 	ts  []uint64
+	dec simple8b.Decoder
 	err error
 }
 
-func NewTimeDecoder(b []byte) TimeDecoder {
-	d := &decoder{}
+func (d *TimeDecoder) Init(b []byte) {
+	d.v = 0
+	d.i = 0
+	d.ts = d.ts[:0]
+	d.err = nil
 	d.decode(b)
-	return d
 }
 
-func (d *decoder) Next() bool {
-	if len(d.ts) == 0 {
+func (d *TimeDecoder) Next() bool {
+	if d.i >= len(d.ts) {
 		return false
 	}
-	d.v = time.Unix(0, int64(d.ts[0]))
-	d.ts = d.ts[1:]
+	d.v = int64(d.ts[d.i])
+	d.i++
 	return true
 }
 
-func (d *decoder) Read() time.Time {
+func (d *TimeDecoder) Read() int64 {
 	return d.v
 }
 
-func (d *decoder) Error() error {
+func (d *TimeDecoder) Error() error {
 	return d.err
 }
 
-func (d *decoder) decode(b []byte) {
+func (d *TimeDecoder) decode(b []byte) {
 	if len(b) == 0 {
 		return
 	}
@@ -239,15 +235,17 @@ func (d *decoder) decode(b []byte) {
 	}
 }
 
-func (d *decoder) decodePacked(b []byte) {
+func (d *TimeDecoder) decodePacked(b []byte) {
 	div := uint64(math.Pow10(int(b[0] & 0xF)))
 	first := uint64(binary.BigEndian.Uint64(b[1:9]))
 
-	enc := simple8b.NewDecoder(b[9:])
+	d.dec.SetBytes(b[9:])
 
-	deltas := []uint64{first}
-	for enc.Next() {
-		deltas = append(deltas, enc.Read())
+	d.i = 0
+	deltas := d.ts[:0]
+	deltas = append(deltas, first)
+	for d.dec.Next() {
+		deltas = append(deltas, d.dec.Read())
 	}
 
 	// Compute the prefix sum and scale the deltas back up
@@ -256,10 +254,11 @@ func (d *decoder) decodePacked(b []byte) {
 		deltas[i] = deltas[i-1] + dgap
 	}
 
+	d.i = 0
 	d.ts = deltas
 }
 
-func (d *decoder) decodeRLE(b []byte) {
+func (d *TimeDecoder) decodeRLE(b []byte) {
 	var i, n int
 
 	// Lower 4 bits hold the 10 based exponent so we can scale the values back up
@@ -281,9 +280,9 @@ func (d *decoder) decodeRLE(b []byte) {
 	count, _ := binary.Uvarint(b[i:])
 
 	// Rebuild construct the original values now
-	deltas := make([]uint64, count)
-	for i := range deltas {
-		deltas[i] = value
+	deltas := d.ts[:0]
+	for i := 0; i < int(count); i++ {
+		deltas = append(deltas, value)
 	}
 
 	// Reverse the delta-encoding
@@ -292,10 +291,12 @@ func (d *decoder) decodeRLE(b []byte) {
 		deltas[i] = deltas[i-1] + deltas[i]
 	}
 
+	d.i = 0
 	d.ts = deltas
 }
 
-func (d *decoder) decodeRaw(b []byte) {
+func (d *TimeDecoder) decodeRaw(b []byte) {
+	d.i = 0
 	d.ts = make([]uint64, len(b)/8)
 	for i := range d.ts {
 		d.ts[i] = binary.BigEndian.Uint64(b[i*8 : i*8+8])
