@@ -37,9 +37,9 @@ type StatementExecutor struct {
 	MaxSelectBucketsN int
 
 	Replicator interface {
-		Query() chan<- *influxql.QueryParams
+		Query() chan<- string
 	}
-	replQuery chan<- *influxql.QueryParams
+	replQuery chan<- string
 }
 
 func (e *StatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx *influxql.ExecutionContext) error {
@@ -202,19 +202,16 @@ func (e *StatementExecutor) ExecuteStatement(stmt influxql.Statement, ctx *influ
 	}
 
 	if e.Replicator != nil && replicateStmt && !ctx.ReadOnly {
-		logger.Println("sending replQuery", stmt.String())
 		if e.replQuery == nil {
-			logger.Println("init'ing replQuery")
 			e.replQuery = e.Replicator.Query()
-			logger.Println("replQuery init'd")
 		}
-		e.replQuery <- &influxql.QueryParams{
-			Query: &influxql.Query{
-				Statements: []influxql.Statement{stmt},
-			},
-			Database: ctx.Database, // TODO: figure out where database can come from now
-		}
-		logger.Printf("replQuery %s sent\n", stmt.String())
+		e.replQuery <- fmt.Sprintf("%s %s", stmt.String(), ctx.Database)
+		// e.replQuery <- &influxql.QueryParams{
+		// 	Query: &influxql.Query{
+		// 		Statements: []influxql.Statement{stmt},
+		// 	},
+		// 	Database: ctx.Database,
+		// }
 	}
 	return nil
 }

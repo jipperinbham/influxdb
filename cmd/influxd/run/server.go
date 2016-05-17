@@ -188,6 +188,7 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 		MaxSelectPointN:   c.Cluster.MaxSelectPointN,
 		MaxSelectSeriesN:  c.Cluster.MaxSelectSeriesN,
 		MaxSelectBucketsN: c.Cluster.MaxSelectBucketsN,
+		Replicator:        s.Replicator,
 	}
 	s.QueryExecutor.QueryTimeout = time.Duration(c.Cluster.QueryTimeout)
 	s.QueryExecutor.LogQueriesAfter = time.Duration(c.Cluster.LogQueriesAfter)
@@ -195,7 +196,6 @@ func NewServer(c *Config, buildInfo *BuildInfo) (*Server, error) {
 	if c.Data.QueryLogEnabled {
 		s.QueryExecutor.Logger = log.New(os.Stderr, "[query] ", log.LstdFlags)
 	}
-	s.QueryExecutor.Replicator = s.Replicator
 	s.Replicator.QueryExecutor = s.QueryExecutor
 
 	// Initialize the monitor

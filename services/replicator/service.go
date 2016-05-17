@@ -40,14 +40,14 @@ type Service struct {
 	haltSync          chan struct{}
 	mu                sync.Mutex
 
-	query chan *influxql.QueryParams
+	query chan string
 
 	currentState string
 
 	Logger  *log.Logger
 	statMap *expvar.Map
 
-	QueryExecutor influxql.QueryExecutor
+	QueryExecutor *influxql.QueryExecutor
 
 	PointsWriter interface {
 		WritePoints(database, retentionPolicy string, consistencyLevel models.ConsistencyLevel, points []models.Point) error
@@ -63,7 +63,7 @@ func NewService(c Config) *Service {
 		replSetName:      c.ReplSetName,
 		nodeID:           c.NodeID,
 		points:           make(chan *cluster.WritePointsRequest),
-		query:            make(chan *influxql.QueryParams),
+		query:            make(chan string),
 		Logger:           log.New(os.Stderr, "[replicator] ", log.LstdFlags),
 		statMap:          influxdb.NewStatistics("replicator", "replicator", nil),
 		closed:           true,
@@ -226,7 +226,7 @@ func (s *Service) Points() chan<- *cluster.WritePointsRequest {
 }
 
 // Query returns a channel into which a query can be sent.
-func (s *Service) Query() chan<- *influxql.QueryParams {
+func (s *Service) Query() chan<- string {
 	return s.query
 }
 
@@ -366,27 +366,26 @@ func (s *Service) readQueries() {
 				return
 			}
 			s.mu.Unlock()
-			for _, stmt := range q.Query.Statements {
-				s.Logger.Println("received statement:", stmt)
-				partition, offset, err := s.replicationWriter.SendMessage(&sarama.ProducerMessage{
-					Topic: "influxdb_schema",
-					Value: sarama.ByteEncoder(fmt.Sprintf("%s %s", q.Database, stmt.String())),
-				})
-				if err != nil {
-					// s.statMap.Add(statWriteFailures, 1)
-					return
-				}
-				s.Logger.Printf("statement sent to %d with offset %d\n", partition, offset)
-				s.schemaReader.MarkOffset(
-					&sarama.ConsumerMessage{
-						Offset:    offset,
-						Topic:     "influxdb_schema",
-						Partition: partition,
-					},
-					"",
-				)
-				s.Logger.Printf("offset %d committed\n", offset)
+			db, stmt, err := scanDatabase([]byte(q), 0)
+			s.Logger.Println("received statement:", stmt)
+			partition, offset, err := s.replicationWriter.SendMessage(&sarama.ProducerMessage{
+				Topic: "influxdb_schema",
+				Value: sarama.ByteEncoder(fmt.Sprintf("%s %s", db, stmt)),
+			})
+			if err != nil {
+				// s.statMap.Add(statWriteFailures, 1)
+				return
 			}
+			s.Logger.Printf("statement sent to %d with offset %d\n", partition, offset)
+			s.schemaReader.MarkOffset(
+				&sarama.ConsumerMessage{
+					Offset:    offset,
+					Topic:     "influxdb_schema",
+					Partition: partition,
+				},
+				"",
+			)
+			s.Logger.Printf("offset %d committed\n", offset)
 		case <-s.closing:
 			return
 		}
@@ -422,7 +421,7 @@ func (s *Service) processQueries() {
 				s.Logger.Fatalln("failed ParseQuery", err)
 				return
 			}
-			s.QueryExecutor.ExecuteQuery(query, string(db), 10000, s.closing)
+			s.QueryExecutor.ExecuteQuery(query, string(db), 10000, false, s.closing)
 			s.schemaReader.MarkOffset(msg, "")
 			log.Printf("Marked schema offset %d for %s\n", msg.Offset, query)
 		}
